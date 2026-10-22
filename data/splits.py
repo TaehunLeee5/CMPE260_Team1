@@ -3,10 +3,12 @@ import json
 import random
 from pathlib import Path
 
+
 def read_lines(path):
     """Read dataset lines without blank lines or comment headers."""
     with path.open(encoding="utf-8-sig") as file:
         return [line.strip() for line in file if line.strip() and not line.lstrip().startswith("#")]
+
 
 def load_data(graph_folder, article_order_path):
     """Load article IDs and check their alignment with the distance matrix."""
@@ -25,6 +27,7 @@ def load_data(graph_folder, article_order_path):
         if len(row) != size or set(row) - set("0123456789_") or row[index] != "0":
             raise ValueError(f"Invalid distance matrix row: {index}")
     return article_ids, matrix
+
 
 def sample_tasks(article_ids, matrix, count):
     """Sample unique reachable pairs uniformly with seed 42."""
@@ -49,6 +52,7 @@ def sample_tasks(article_ids, matrix, count):
         })
     return tasks
 
+
 def split_tasks(tasks):
     """Shuffle with seed 42 and split unique tasks into 80/10/10 sets."""
     tasks = tasks.copy()
@@ -61,12 +65,14 @@ def split_tasks(tasks):
         "test": tasks[val_end:],
     }
 
+
 def save_splits(splits, output_folder):
     """Save each split as a JSON list of start, target, and shortest distance."""
     output_folder.mkdir(parents=True, exist_ok=True)
     for name, tasks in splits.items():
         with (output_folder / f"{name}.json").open("w", encoding="utf-8") as file:
             json.dump(tasks, file, ensure_ascii=False, indent=2)
+
 
 def main():
     """Sample navigation tasks and save train, validation, and test splits."""
@@ -83,6 +89,7 @@ def main():
     for name, records in splits.items():
         print(f"{name}: {len(records):,} tasks")
     print(f"Saved JSON files to: {output_folder}")
+
 
 if __name__ == "__main__":
     main()
