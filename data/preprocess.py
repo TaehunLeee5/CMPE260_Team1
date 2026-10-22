@@ -114,6 +114,5 @@ def main():
     print(f"Saved {len(articles)} articles and {link_count} links.")
     print(f"Output folder: {output_folder}")
 
-
 if __name__ == "__main__":
     main()
