@@ -3,7 +3,10 @@ name = "cmpe260-wiki-agent"
 version = "0.1.0"
 description = "Wiki Game agent project using the Wikispeedia dataset"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "gymnasium>=1.0,<2",
+    "numpy>=1.26",
+]
 
 [tool.uv]
 package = false
