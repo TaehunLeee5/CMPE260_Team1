@@ -7,6 +7,7 @@ import torch
 from policy.llm_policy import WikiGamePolicy
 from policy.prompt import SYSTEM_PROMPT
 
+
 @pytest.fixture(scope="session")
 def wiki_policy():
     """Load the actual Qwen model once through WikiGamePolicy."""
@@ -79,11 +80,42 @@ def test_choose_action(wiki_policy, observation, deterministic):
     assert isinstance(log_prob, float)
     assert math.isfinite(log_prob)
     assert log_prob <= 0
-    tolerance = 0.05 if wiki_policy.model.dtype == torch.bfloat16 else 0.001
-    assert recomputed.item() == pytest.approx(log_prob, abs=tolerance)
+    assert recomputed.item() == pytest.approx(log_prob, abs=1e-4)
     title = next(link["title"] for link in observation["actions"] if link["id"] == action)
     mode = "greedy" if deterministic else "sampled"
     print(f"\n{mode}: {title} (ID {action}), log probability: {log_prob:.6f}")
+
+
+@pytest.mark.parametrize("action", [1, 10])
+def test_rare_action_log_prob(wiki_policy, observation, monkeypatch, action):
+    """Check rare sampled actions using real model scores and controlled draws."""
+    tokens = iter(wiki_policy._action_sequences(observation["actions"])[action])
+
+    def select_token(probabilities, num_samples=1, **kwargs):
+        """Select a specified possible event without changing its probability."""
+        token = next(tokens)
+        assert probabilities[0, token] > 0
+        return torch.tensor([[token]], device=probabilities.device)
+
+    monkeypatch.setattr(torch, "multinomial", select_token)
+    selected, log_prob = wiki_policy.choose_action(observation)
+    with torch.no_grad():
+        recomputed = wiki_policy.get_action_log_prob(observation, selected)
+
+    assert selected == action
+    assert math.isfinite(log_prob)
+    assert recomputed.item() == pytest.approx(log_prob, abs=1e-4)
+
+
+def test_action_probabilities_sum_to_one(wiki_policy, observation):
+    """Check that the complete valid-action distribution is normalized."""
+    with torch.no_grad():
+        scores = torch.stack([
+            wiki_policy.get_action_log_prob(observation, action["id"])
+            for action in observation["actions"]
+        ])
+
+    assert scores.logsumexp(dim=0).item() == pytest.approx(0, abs=1e-5)
 
 
 def test_selects_direct_target(wiki_policy, observation):
