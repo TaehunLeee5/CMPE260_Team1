@@ -13,6 +13,9 @@ class WikiGameEnv(gym.Env):
     Use get_llm_observation() for readable titles and full current article text.
     Only the current article's text is exposed. Actions index its outgoing links.
     The caller supplies start and target IDs through reset options.
+
+    Intermediate steps and failed episodes receive zero reward. Success earns
+    1 plus 0.1 times the fraction of the click budget remaining.
     """
 
     def __init__(self, articles_path="data/processed/articles.json", max_clicks=20,
@@ -37,9 +40,6 @@ class WikiGameEnv(gym.Env):
 
         self.max_clicks = max_clicks
         self.history_size = history_size
-        self.click_penalty = -0.01
-        self.success_reward = 1.0
-        self.failure_reward = -1.0
         self.max_links = max(len(a["outgoing"]) for a in self.articles.values())
         if self.max_links == 0:
             raise ValueError("The graph has no outgoing links.")
@@ -140,7 +140,12 @@ class WikiGameEnv(gym.Env):
         }
 
     def step(self, action):
-        """Follow a link and return observation, reward, terminated, truncated, and info."""
+        """Follow a link and give a terminal reward only when the target is reached.
+
+        Success earns 1 + 0.1 * remaining_clicks / max_clicks. All other
+        rewards are zero. Return observation, reward, terminated, truncated,
+        and info.
+        """
         if self.done:
             raise gym.error.ResetNeeded("Call reset() before starting or continuing an episode.")
         if not self.action_space.contains(action):
@@ -148,7 +153,7 @@ class WikiGameEnv(gym.Env):
         action = int(action)
         links = self.articles[self.current]["outgoing"]
         self.clicks += 1
-        reward = self.click_penalty
+        reward = 0.0
 
         if action >= len(links):
             self.reason = "invalid_action"
@@ -164,8 +169,7 @@ class WikiGameEnv(gym.Env):
 
         self.done = bool(self.reason)
         if self.reason == "success":
-            reward += self.success_reward
-        elif self.done:
-            reward += self.failure_reward
+            remaining_fraction = (self.max_clicks - self.clicks) / self.max_clicks
+            reward = 1.0 + 0.1 * remaining_fraction
         self.episode_return += reward
         return self.get_observation(), reward, self.done, False, self.get_info()
