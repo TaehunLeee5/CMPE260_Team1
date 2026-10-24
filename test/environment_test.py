@@ -1,5 +1,7 @@
 import json
 
+import json
+
 import gymnasium as gym
 import pytest
 
@@ -73,7 +75,8 @@ def test_step_reaches_target(env):
 
     assert env.observation_space.contains(observation)
     assert info["path"] == ["Start", "Middle"]
-    assert reward == pytest.approx(-0.01)
+    assert reward == 0.0
+    assert info["episode_return"] == 0.0
     assert not terminated and not truncated
 
     observation, reward, terminated, truncated, info = env.step(0)
@@ -81,10 +84,32 @@ def test_step_reaches_target(env):
     assert info["path"] == ["Start", "Middle", "Goal"]
     assert info["success"]
     assert info["clicks"] == 2
-    assert info["episode_return"] == pytest.approx(0.98)
-    assert reward == pytest.approx(0.99)
+    assert info["episode_return"] == pytest.approx(1.0)
+    assert reward == pytest.approx(1.0)
     assert terminated and not truncated
     assert not env.action_masks().any()
+
+
+@pytest.mark.parametrize("actions, expected_reward", [
+    ([1], 1.05),
+    ([0, 1], 1.0),
+])
+def test_success_efficiency_bonus(env, actions, expected_reward):
+    """Give shorter successful routes a larger reward within the same budget."""
+    env.reset(options={"start": "Start", "target": "Middle"})
+    for index, action in enumerate(actions):
+        observation, reward, terminated, truncated, info = env.step(action)
+        if index < len(actions) - 1:
+            assert reward == 0.0
+            assert not terminated and not truncated
+
+    assert env.observation_space.contains(observation)
+    assert info["success"]
+    assert info["reason"] == "success"
+    assert info["clicks"] == len(actions)
+    assert reward == pytest.approx(expected_reward)
+    assert info["episode_return"] == pytest.approx(expected_reward)
+    assert terminated and not truncated
 
 
 @pytest.mark.parametrize("actions, reason", [
@@ -93,16 +118,17 @@ def test_step_reaches_target(env):
     ([1, 1], "invalid_action"),
 ])
 def test_episode_failures(env, actions, reason):
-    """End unsuccessful episodes with the failure penalty and correct reason."""
+    """Give zero reward throughout failed episodes and report the correct reason."""
     env.reset(options={"start": "Start", "target": "Goal"})
     for action in actions:
         observation, reward, terminated, truncated, info = env.step(action)
+        assert reward == 0.0
 
     assert env.observation_space.contains(observation)
     assert terminated and not truncated
     assert not info["success"]
     assert info["reason"] == reason
-    assert reward == pytest.approx(-1.01)
+    assert info["episode_return"] == 0.0
 
 
 def test_step_requires_reset(env):
