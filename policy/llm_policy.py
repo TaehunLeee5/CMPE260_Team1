@@ -119,6 +119,9 @@ class WikiGamePolicy:
         Sample actions when collecting training routes. Set deterministic
         to True for greedy evaluation. The log probability is a float;
         use get_action_log_prob when gradients are needed.
+
+        Sampling uses temperature 1 with top-k and top-p filtering disabled
+        so rollout probabilities match the training calculation.
         """
         self.model.eval()
         sequences = self._action_sequences(observation["actions"])
@@ -140,7 +143,9 @@ class WikiGamePolicy:
             output_scores=True,
         )
         if not deterministic:
+            config.temperature = 1.0
             config.top_k = 0
+            config.top_p = 1.0
 
         result = self.model.generate(
             **inputs,
