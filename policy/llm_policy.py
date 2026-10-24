@@ -114,7 +114,7 @@ class WikiGamePolicy:
         use get_action_log_prob when gradients are needed.
 
         Sampling uses temperature 1 with top-k and top-p filtering disabled
-        so rollout probabilities match the training calculation.
+        and no KV cache to match the training calculation.
         """
         self.model.eval()
         sequences = self._action_sequences(observation["actions"])
@@ -134,6 +134,7 @@ class WikiGamePolicy:
             pad_token_id=self.tokenizer.eos_token_id,
             return_dict_in_generate=True,
             output_scores=True,
+            use_cache=False,
         )
         if not deterministic:
             config.temperature = 1.0
@@ -144,6 +145,7 @@ class WikiGamePolicy:
             **inputs,
             generation_config=config,
             prefix_allowed_tokens_fn=restrict_tokens,
+            logits_to_keep=1,
         )
         generated = result.sequences[0, prompt_length:].tolist()
 
@@ -164,7 +166,9 @@ class WikiGamePolicy:
         """Calculate an action's log probability with gradients.
 
         Use this during training updates. It applies the same prompt and
-        valid-action restrictions as choose_action.
+        valid-action restrictions as choose_action. Score each prefix
+        separately with one output position and no KV cache, matching
+        generation even when the model uses reduced precision.
 
         Training code controls model mode and should disable dropout when
         comparing old and new policy probabilities.
@@ -177,30 +181,30 @@ class WikiGamePolicy:
             observation, max(map(len, sequences.values()))
         )
         sequence = sequences[action]
-        continuation = torch.tensor(
-            [sequence[:-1]],
-            device=self.model.device,
-            dtype=torch.long,
-        )
-        input_ids = torch.cat(
-            [inputs["input_ids"], continuation], dim=1
-        )
-
-        logits = self.model(
-            input_ids=input_ids,
-            attention_mask=torch.ones_like(input_ids),
-            use_cache=False,
-            logits_to_keep=len(sequence),
-        ).logits[0].float()
-
+        input_ids = inputs["input_ids"]
         log_probs = []
         for position, token in enumerate(sequence):
             choices = self._allowed_tokens(
                 sequences, sequence[:position]
             )
-            probabilities = torch.log_softmax(
-                logits[position, choices], dim=-1
-            )
-            log_probs.append(probabilities[choices.index(token)])
+            if len(choices) > 1:
+                logits = self.model(
+                    input_ids=input_ids,
+                    attention_mask=torch.ones_like(input_ids),
+                    use_cache=False,
+                    logits_to_keep=1,
+                ).logits[0, -1].float()
+                probabilities = torch.log_softmax(logits[choices], dim=-1)
+                log_probs.append(probabilities[choices.index(token)])
 
+            next_token = torch.tensor(
+                [[token]], device=input_ids.device, dtype=torch.long
+            )
+            input_ids = torch.cat([input_ids, next_token], dim=1)
+
+        if not log_probs:
+            return torch.zeros(
+                (), device=input_ids.device,
+                requires_grad=torch.is_grad_enabled(),
+            )
         return torch.stack(log_probs).sum()
