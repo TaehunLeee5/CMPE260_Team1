@@ -6,11 +6,19 @@ requires-python = ">=3.11"
 dependencies = [
     "gymnasium>=1.0,<2",
     "numpy>=1.26",
+    "torch>=2.4",
+    "transformers>=4.56,<6",
 ]
 
-[tool.uv]
-package = false
+[dependency-groups]
+dev = [
+    "pytest>=8,<10",
+    "tokenizers>=0.21,<1",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["test"]
 pythonpath = ["."]
+
+[tool.uv]
+package = false
