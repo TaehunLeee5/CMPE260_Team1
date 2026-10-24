@@ -8,19 +8,12 @@ class WikiGamePolicy:
     """Use a language model to choose links in the Wiki Game."""
 
     def __init__(self, model_name="Qwen/Qwen3-1.7B", max_input_tokens=None):
-        """Load the model, tokenizer, and fixed game instructions.
-
-        Args:
-            model_name: Hugging Face model name or local model folder.
-            max_input_tokens: Optional prompt token limit. If omitted, use
-                the model's context limit, reserving space for the answer.
-                Only article text is shortened when necessary.
-        """
+        """Load the model, tokenizer, and fixed game instructions."""
         self.system_prompt = SYSTEM_PROMPT
         self.max_input_tokens = max_input_tokens
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        dtype = torch.float32
+        dtype = "auto"
         if device == "cuda":
             dtype = (
                 torch.bfloat16
