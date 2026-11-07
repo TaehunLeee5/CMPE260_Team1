@@ -18,10 +18,21 @@ class TargetPolicy:
         self.deterministic_calls.append(deterministic)
         for action in observation["actions"]:
             if action["title"] == observation["target_title"]:
-                return action["id"], 0.0
+                return self.follow(action["id"])
         if observation["actions"]:
-            return observation["actions"][0]["id"], 0.0
-        return observation["back_action_id"], 0.0
+            return self.follow(observation["actions"][0]["id"])
+        return {
+            "action": observation["back_action_id"],
+            "tool_call": {"name": "go_back", "arguments": {}}, "log_prob": 0.0,
+        }
+
+    @staticmethod
+    def follow(link_id):
+        return {
+            "action": link_id,
+            "tool_call": {"name": "follow_link", "arguments": {"link_id": link_id}},
+            "log_prob": 0.0,
+        }
 
 
 @pytest.fixture
@@ -80,6 +91,7 @@ def test_run_episode(runner, deterministic):
         assert observation["target_title"] == "France"
         assert observation["remaining_clicks"] == runner.env.max_clicks - index
         assert current["outgoing"][step["action"]] == episode["path"][index + 1]
+        assert step["tool_call"] == {"name": "follow_link", "arguments": {"link_id": step["action"]}}
         assert isinstance(step["log_prob"], float)
         assert math.isfinite(step["log_prob"]) and step["log_prob"] <= 0
         assert step["log_prob"] == 0.0
@@ -113,6 +125,7 @@ def test_failed_episode(runner, start, reason, clicks):
         assert episode["path"] == ["Dead_end_start", "Dead_end", "Dead_end_start"]
         assert episode["navigation_stack"] == ["Dead_end_start"]
         assert episode["steps"][1]["action"] == runner.env.back_action
+        assert episode["steps"][1]["tool_call"] == {"name": "go_back", "arguments": {}}
         assert episode["steps"][1]["observation"]["back_available"]
         assert episode["steps"][1]["observation"]["history"] == ["Dead end start", "Dead end"]
 
@@ -129,3 +142,15 @@ def test_runner_reuse(runner):
     assert second["clicks"] == 1
     assert second["steps"][0]["observation"]["remaining_clicks"] == runner.env.max_clicks
     assert second["episode_return"] == pytest.approx(1.05)
+
+
+def test_evaluation_keeps_compact_tool_trace(runner):
+    from evaluation.evaluate import evaluate
+
+    report = evaluate(runner, [{"start": "Europe", "target": "France", "shortest_distance": 1}])
+    episode = report["episodes"][0]
+    assert report["summary"]["successes"] == 1
+    assert episode["tool_calls"] == [{"name": "follow_link", "arguments": {"link_id": 1}}]
+    assert episode["navigation_stack"] == ["Europe", "France"]
+    assert "steps" not in episode  # Evaluation files omit bulky training inputs.
+    assert json.loads(json.dumps(report)) == report

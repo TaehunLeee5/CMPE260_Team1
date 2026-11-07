@@ -1,249 +1,270 @@
-import math
+"""Policy mechanics use a tiny random actor; integration tests load real Qwen."""
+
 from copy import deepcopy
+import json
+import math
+import string
 
 import pytest
 import torch
+from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+from transformers import PreTrainedTokenizerFast, Qwen3Config, Qwen3ForCausalLM
 
+from environment.environment import WikiGameEnv
+from environment.episode_runner import EpisodeRunner
 from policy.llm_policy import WikiGamePolicy
-from policy.prompt import SYSTEM_PROMPT
 
 
-@pytest.fixture(scope="session")
-def wiki_policy():
-    """Load the actual Qwen model once through WikiGamePolicy."""
-    return WikiGamePolicy()
+@pytest.fixture(scope="module")
+def policy():
+    """Use a local character tokenizer and random Qwen architecture, not trained weights."""
+    previous_threads = torch.get_num_threads()
+    previous_rng = torch.random.get_rng_state()
+    torch.set_num_threads(1)
+    torch.manual_seed(42)
+    vocabulary = {"<|im_end|>": 0, "<|pad|>": 1, "<|unk|>": 2}
+    vocabulary.update({char: index + 3 for index, char in enumerate(string.printable)})
+    backend = Tokenizer(models.WordLevel(vocabulary, unk_token="<|unk|>"))
+    backend.pre_tokenizer = pre_tokenizers.Split("", behavior="isolated")
+    backend.decoder = decoders.Fuse()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend, eos_token="<|im_end|>",
+        pad_token="<|pad|>", unk_token="<|unk|>",
+    )
+    tokenizer.chat_template = (
+        "{% for message in messages %}<|im_start|>{{ message.role }}\n{{ message.content }}"
+        "{% if loop.first %}\n<tools>{{ tools | tojson }}</tools>{% endif %}<|im_end|>\n{% endfor %}"
+        "{% if add_generation_prompt %}<|im_start|>assistant\n"
+        "{% if not enable_thinking %}<think>\n\n</think>\n\n{% endif %}{% endif %}"
+    )
+    model = Qwen3ForCausalLM(Qwen3Config(
+        vocab_size=len(tokenizer), hidden_size=16, intermediate_size=32,
+        num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=1,
+        head_dim=8, max_position_embeddings=4096, attention_dropout=0.0,
+        eos_token_id=tokenizer.eos_token_id, pad_token_id=tokenizer.pad_token_id,
+    ))
+    yield WikiGamePolicy(model=model, tokenizer=tokenizer)
+    torch.set_num_threads(previous_threads)
+    torch.random.set_rng_state(previous_rng)
 
 
 @pytest.fixture
 def observation():
-    """Provide the same readable fields returned by the environment."""
     return {
-        "current_title": "Europe",
-        "target_title": "France",
-        "text": "Europe is a continent that includes many countries.",
-        "history": ["Europe"],
-        "remaining_clicks": 10,
-        "actions": [
-            {"id": 1, "title": "Germany"},
-            {"id": 10, "title": "Italy"},
-            {"id": 100, "title": "France"},
-        ],
+        "current_title": "Europe", "target_title": "France",
+        "text": "Europe includes many countries.", "history": ["Earth", "Europe"],
+        "navigation_stack": ["Earth", "Europe"], "remaining_clicks": 10,
+        "back_available": True, "back_destination": "Earth", "back_action_id": 300,
+        "actions": [{"id": i, "title": title} for i, title in [
+            (0, "Germany"), (2, "Italy"), (10, "Spain"), (100, "France"),
+        ]],
     }
 
 
-def test_build_prompt(wiki_policy, observation):
-    """Fill the template without altering article text or observation data."""
-    observation["history"] = ["Earth", "Europe"]
-    observation["text"] = "Article content containing {target_title} and {links}."
+def assert_decision(policy, observation, decision, atol=1e-5):
+    calls = policy._tool_calls(observation)
+    assert decision["tool_call"] == calls[decision["action"]]
+    assert json.loads(json.dumps(decision)) == decision
+    tokens = decision["token_ids"]
+    assert tokens[-1] == policy.tokenizer.eos_token_id
+    raw = policy.tokenizer.decode(tokens[:-1], clean_up_tokenization_spaces=False)
+    assert raw.startswith("<tool_call>\n") and raw.endswith("\n</tool_call>")
+    assert json.loads(raw[len("<tool_call>\n"):-len("\n</tool_call>")]) == decision["tool_call"]
+    with torch.enable_grad():
+        rescored = policy.get_token_log_probs(
+            decision["prompt_ids"], tokens, decision["token_choices"],
+        )
+    expected = torch.tensor(decision["token_log_probs"], device=rescored.device)
+    assert rescored.requires_grad
+    assert torch.allclose(rescored.detach(), expected, atol=atol, rtol=0)
+    assert math.isfinite(decision["log_prob"]) and decision["log_prob"] <= 0
+    assert rescored.detach().sum().item() == pytest.approx(decision["log_prob"], abs=atol)
+    assert math.exp(rescored.detach().sum().item() - decision["log_prob"]) == pytest.approx(1, abs=atol)
+    for score, choices in zip(decision["token_log_probs"], decision["token_choices"]):
+        if len(choices) == 1:
+            assert score == 0
+
+
+def test_prompt_and_tool_definitions(policy, observation):
     original = deepcopy(observation)
-
-    prompt = wiki_policy.build_prompt(observation)
-
-    assert "Target article: France" in prompt
-    assert "Current article: Europe" in prompt
-    assert "Remaining clicks: 10" in prompt
-    assert "Recent history: Earth -> Europe" in prompt
-    assert observation["text"] in prompt
-    for action in observation["actions"]:
-        assert f"{action['id']}: {action['title']}" in prompt
-
-    inputs = wiki_policy._prepare_inputs(observation, 4)
-    formatted = wiki_policy.tokenizer.decode(inputs["input_ids"][0])
-    assert f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>" in formatted
-    assert f"<|im_start|>user\n{prompt}<|im_end|>" in formatted
-    assert "<think>\n\n</think>" in formatted
+    inputs = policy._prepare_inputs(observation, 80)
+    prompt = policy.tokenizer.decode(inputs["input_ids"][0])
+    for text in ["follow_link", "go_back", "link_id", "Target article: France",
+                 "Back: Earth", "Navigation stack: Earth -> Europe", "<think>\n\n</think>"]:
+        assert text in prompt
+    assert "back_action_id" not in prompt
     assert observation == original
-    print(f"\nFormatted prompt:\n{formatted}")
+    observation.update(back_available=False, back_action_id=None, back_destination=None)
+    prompt = policy.tokenizer.decode(policy._prepare_inputs(observation, 80)["input_ids"][0])
+    assert '"name": "go_back"' not in prompt
+    assert "Back: unavailable" in prompt
+    assert set(policy._tool_calls(observation)) == {0, 2, 10, 100}
 
 
-def test_init(wiki_policy):
-    """Keep the loaded model, tokenizer, and prompt settings on the policy."""
-    assert wiki_policy.model.name_or_path == "Qwen/Qwen3-1.7B"
-    assert wiki_policy.model.config.model_type == "qwen3"
-    assert not wiki_policy.model.training
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    assert wiki_policy.model.device.type == device
-    tokens = wiki_policy.tokenizer.encode("100", add_special_tokens=False)
-    assert wiki_policy.tokenizer.decode(tokens) == "100"
-    assert wiki_policy.max_input_tokens is None
+@pytest.mark.parametrize("count", [1, 2, 9, 10, 11, 99, 100, 101, 294])
+def test_all_calls_are_reachable(policy, observation, count):
+    observation["actions"] = [{"id": i, "title": str(i)} for i in range(count)]
+    calls = policy._tool_calls(observation)
+    sequences = policy._action_sequences(calls)
+    assert len({tuple(s) for s in sequences.values()}) == count + 1
+    for action, tokens in sequences.items():
+        for position, token in enumerate(tokens):
+            assert token in policy._allowed_tokens(sequences, tokens[:position])
+        assert not policy._allowed_tokens(sequences, tokens)
+        text = policy.tokenizer.decode(tokens[:-1])
+        assert json.loads(text[len("<tool_call>\n"):-len("\n</tool_call>")]) == calls[action]
 
 
 @pytest.mark.parametrize("deterministic", [False, True])
-def test_choose_action(wiki_policy, observation, deterministic):
-    """Return valid link IDs and matching rollout and training scores."""
-    action, log_prob = wiki_policy.choose_action(observation, deterministic)
+def test_rollout_and_training_probabilities_match(policy, observation, deterministic):
+    decision = policy.choose_action(observation, deterministic)
+    assert_decision(policy, observation, decision)
     with torch.no_grad():
-        recomputed = wiki_policy.get_action_log_prob(observation, action)
-
-    assert isinstance(action, int)
-    assert action in {1, 10, 100}
-    assert isinstance(log_prob, float)
-    assert math.isfinite(log_prob)
-    assert log_prob <= 0
-    assert recomputed.item() == pytest.approx(log_prob, abs=1e-4)
-    title = next(link["title"] for link in observation["actions"] if link["id"] == action)
-    mode = "greedy" if deterministic else "sampled"
-    print(f"\n{mode}: {title} (ID {action}), log probability: {log_prob:.6f}")
+        total = policy.get_action_log_prob(observation, decision["action"]).item()
+    assert total == pytest.approx(decision["log_prob"], abs=1e-5)
 
 
-@pytest.mark.parametrize("action", [1, 10])
-def test_rare_action_log_prob(wiki_policy, observation, monkeypatch, action):
-    """Check rare sampled actions using real model scores and controlled draws."""
-    tokens = iter(wiki_policy._action_sequences(observation["actions"])[action])
+def test_model_sampling_defaults_do_not_change_policy(policy, observation, monkeypatch):
+    defaults = deepcopy(policy.model.generation_config)
+    defaults.temperature, defaults.top_p, defaults.top_k = 0.6, 0.95, 20
+    monkeypatch.setattr(policy.model, "generation_config", defaults)
+    assert_decision(policy, observation, policy.choose_action(observation))
 
-    def select_token(probabilities, num_samples=1, **kwargs):
-        """Select a specified possible event without changing its probability."""
+
+@pytest.mark.parametrize("action", [0, 10, 100, 300])
+def test_controlled_draw_covers_both_tools(policy, observation, monkeypatch, action):
+    tokens = iter(policy._action_sequences(policy._tool_calls(observation))[action])
+
+    def draw(probabilities, num_samples=1, **kwargs):
         token = next(tokens)
         assert probabilities[0, token] > 0
         return torch.tensor([[token]], device=probabilities.device)
 
-    monkeypatch.setattr(torch, "multinomial", select_token)
-    selected, log_prob = wiki_policy.choose_action(observation)
-    with torch.no_grad():
-        recomputed = wiki_policy.get_action_log_prob(observation, selected)
-
-    assert selected == action
-    assert math.isfinite(log_prob)
-    assert recomputed.item() == pytest.approx(log_prob, abs=1e-4)
+    monkeypatch.setattr(torch, "multinomial", draw)
+    decision = policy.choose_action(observation)
+    assert decision["action"] == action
+    assert_decision(policy, observation, decision)
 
 
-def test_action_probabilities_sum_to_one(wiki_policy, observation):
-    """Check that the complete valid-action distribution is normalized."""
+def test_complete_action_distribution_normalized(policy, observation):
     with torch.no_grad():
         scores = torch.stack([
-            wiki_policy.get_action_log_prob(observation, action["id"])
-            for action in observation["actions"]
+            policy.get_action_log_prob(observation, action)
+            for action in policy._tool_calls(observation)
         ])
-
     assert scores.logsumexp(dim=0).item() == pytest.approx(0, abs=1e-5)
 
 
-def test_selects_direct_target(wiki_policy, observation):
-    """Check that greedy decoding selects the target when it is directly linked."""
-    action, _ = wiki_policy.choose_action(observation, deterministic=True)
-
-    assert action == 100, f"Expected France (ID 100), but the model chose ID {action}."
-
-
-def test_multi_token_action(wiki_policy, observation):
-    """Generate the whole ID when the only valid action needs several tokens."""
-    observation["actions"] = [{"id": 100, "title": "France"}]
-
-    action, log_prob = wiki_policy.choose_action(observation)
-
-    assert action == 100
-    assert log_prob == pytest.approx(0)
+@pytest.mark.parametrize("back_only", [False, True])
+def test_single_legal_call_has_probability_one(policy, observation, back_only):
+    if back_only:
+        observation["actions"] = []
+        expected = 300
+    else:
+        observation.update(back_available=False, back_action_id=None, back_destination=None)
+        observation["actions"] = [{"id": 100, "title": "France"}]
+        expected = 100
+    decision = policy.choose_action(observation)
+    assert decision["action"] == expected
+    assert decision["log_prob"] == 0
+    assert_decision(policy, observation, decision)
 
 
-def test_log_prob_has_gradients(wiki_policy, observation):
-    """Backpropagate through one real parameter to keep memory use small."""
-    parameters = list(wiki_policy.model.parameters())
-    original_flags = [parameter.requires_grad for parameter in parameters]
-    wiki_policy.model.zero_grad(set_to_none=True)
-    try:
-        for parameter in parameters:
-            parameter.requires_grad_(False)
-        weight = wiki_policy.model.model.norm.weight
-        weight.requires_grad_(True)
-
-        log_prob = wiki_policy.get_action_log_prob(observation, 1)
-        (-log_prob).backward()
-
-        assert weight.grad is not None
-        assert torch.isfinite(weight.grad).all()
-        assert weight.grad.abs().sum() > 0
-    finally:
-        wiki_policy.model.zero_grad(set_to_none=True)
-        for parameter, original_flag in zip(parameters, original_flags):
-            parameter.requires_grad_(original_flag)
+@pytest.mark.parametrize("advantage", [1.0, -1.0])
+def test_signed_policy_update(policy, observation, advantage):
+    model = deepcopy(policy.model)
+    actor = WikiGamePolicy(model=model, tokenizer=policy.tokenizer)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    before = actor.get_action_log_prob(observation, 0)
+    assert before.requires_grad
+    (-advantage * before).backward()
+    gradients = [p.grad for p in model.parameters() if p.grad is not None]
+    assert gradients and all(torch.isfinite(g).all() for g in gradients)
+    assert any(g.abs().sum() > 0 for g in gradients)
+    optimizer.step()
+    with torch.no_grad():
+        after = actor.get_action_log_prob(observation, 0).item()
+    assert advantage * (after - before.detach().item()) > 0
 
 
-def test_input_budget(wiki_policy, observation, monkeypatch):
-    """Shorten article text while keeping the target and all actions visible."""
-    empty_text = {**observation, "text": ""}
-    limit = wiki_policy._prepare_inputs(empty_text, 4)["input_ids"].shape[1] + 20
-    observation["text"] = "Article content. " * 500
-    monkeypatch.setattr(wiki_policy, "max_input_tokens", limit)
-
-    inputs = wiki_policy._prepare_inputs(observation, 4)
-    prompt = wiki_policy.tokenizer.decode(inputs["input_ids"][0])
-
+def test_text_truncation_preserves_state_and_links(policy, observation, monkeypatch):
+    empty = {**observation, "text": ""}
+    limit = policy._prepare_inputs(empty, 80)["input_ids"].shape[1] + 20
+    monkeypatch.setattr(policy, "max_input_tokens", limit)
+    observation["text"] = "Article text. " * 1000
+    original = deepcopy(observation)
+    inputs = policy._prepare_inputs(observation, 80)
+    prompt = policy.tokenizer.decode(inputs["input_ids"][0])
     assert inputs["input_ids"].shape[1] <= limit
-    assert SYSTEM_PROMPT in prompt
-    assert "Target article: France" in prompt
     for action in observation["actions"]:
         assert f"{action['id']}: {action['title']}" in prompt
-    assert observation["text"] == "Article content. " * 500
-    monkeypatch.setattr(wiki_policy, "max_input_tokens", 1)
-    with pytest.raises(ValueError, match="links exceed"):
-        wiki_policy._prepare_inputs(observation, 4)
+    assert "Back: Earth" in prompt and "Visited route: Earth -> Europe" in prompt
+    assert observation == original
+    monkeypatch.setattr(policy, "max_input_tokens", 1)
+    with pytest.raises(ValueError, match="state, and links exceed"):
+        policy._prepare_inputs(observation, 80)
 
 
-def test_no_available_actions(wiki_policy, observation):
-    """Reject terminal observations that have no available links."""
+def test_invalid_actions_and_records_rejected(policy, observation):
+    with pytest.raises(ValueError, match="not available"):
+        policy.get_action_log_prob(observation, 99)
+    with pytest.raises(ValueError, match="recorded token"):
+        policy.get_token_log_probs([1], [1], [[2]])
+    observation["actions"].append(observation["actions"][0])
+    with pytest.raises(ValueError, match="unique"):
+        policy.choose_action(observation)
     observation["actions"] = []
-
+    observation["back_available"] = False
     with pytest.raises(ValueError, match="no available actions"):
-        wiki_policy.choose_action(observation)
+        policy.choose_action(observation)
 
+
+def test_real_policy_runner_roundtrip(policy, tmp_path):
+    articles = {
+        "Start": {"title": "Start", "text": "Start", "outgoing": ["Dead"]},
+        "Dead": {"title": "Dead", "text": "Dead", "outgoing": []},
+        "Goal": {"title": "Goal", "text": "PRIVATE", "outgoing": []},
+    }
+    path = tmp_path / "articles.json"
+    path.write_text(json.dumps(articles), encoding="utf-8")
+    env = WikiGameEnv(path, max_clicks=2)
+    episode = EpisodeRunner(env, policy).run_episode("Start", "Goal")
+    assert episode["path"] == ["Start", "Dead", "Start"]
+    assert [step["tool_call"]["name"] for step in episode["steps"]] == ["follow_link", "go_back"]
+    assert json.loads(json.dumps(episode)) == episode
+    for step in episode["steps"]:
+        assert_decision(policy, step["observation"], step)
+
+
+@pytest.fixture(scope="module")
+def real_policy():
+    actor = WikiGamePolicy()
+    # Probability parity needs gradients, but not a full fine-tuning graph.
+    for parameter in actor.model.parameters():
+        parameter.requires_grad_(False)
+    actor.model.model.norm.weight.requires_grad_(True)
+    return actor
+
+
+@pytest.mark.integration
 @pytest.mark.parametrize("deterministic", [False, True])
-def test_mixed_id_prefixes(wiki_policy, observation, deterministic):
-    observation["actions"] = [
-        {"id": 0, "title": "Germany"},
-        {"id": 2, "title": "Italy"},
-        {"id": 10, "title": "Spain"},
-        {"id": 100, "title": "France"},
-    ]
+def test_pretrained_rollout_and_training_match(real_policy, observation, deterministic):
+    decision = real_policy.choose_action(observation, deterministic)
+    assert_decision(real_policy, observation, decision, atol=1e-4)
+    print("\\nTool:", decision["tool_call"], "log probability:", decision["log_prob"])
 
-    action, rollout_log_prob = wiki_policy.choose_action(
-        observation, deterministic=deterministic
-    )
 
-    with torch.no_grad():
-        recomputed = wiki_policy.get_action_log_prob(
-            observation, action
-        )
+@pytest.mark.integration
+@pytest.mark.parametrize("action", [10, 100, 300])
+def test_pretrained_controlled_calls(real_policy, observation, monkeypatch, action):
+    tokens = iter(real_policy._action_sequences(real_policy._tool_calls(observation))[action])
 
-    assert action in {0, 2, 10, 100}
-    assert recomputed.item() == pytest.approx(
-        rollout_log_prob, abs=1e-4
-    )
+    def draw(probabilities, num_samples=1, **kwargs):
+        token = next(tokens)
+        assert probabilities[0, token] > 0
+        return torch.tensor([[token]], device=probabilities.device)
 
-@pytest.mark.parametrize("deterministic", [False, True])
-def test_training_log_prob_matches_rollout(
-    wiki_policy, observation, deterministic
-):
-    observation["actions"] = [
-        {"id": 0, "title": "Germany"},
-        {"id": 2, "title": "Italy"},
-        {"id": 7, "title": "Spain"},
-    ]
-
-    wiki_policy.model.eval()
-
-    action, rollout_log_prob = wiki_policy.choose_action(
-        observation, deterministic=deterministic
-    )
-
-    with torch.enable_grad():
-        training_log_prob = wiki_policy.get_action_log_prob(
-            observation, action
-        )
-
-    assert training_log_prob.requires_grad
-    assert torch.isfinite(training_log_prob).item()
-
-    recomputed = training_log_prob.detach().item()
-    ratio = torch.exp(
-        training_log_prob.detach() - rollout_log_prob
-    ).item()
-
-    print(
-        f"\ndeterministic={deterministic}, action={action}, "
-        f"log_prob_error={abs(recomputed - rollout_log_prob):.8f}, "
-        f"ratio={ratio:.8f}"
-    )
-
-    assert recomputed == pytest.approx(
-        rollout_log_prob, abs=1e-4
-    )
+    monkeypatch.setattr(torch, "multinomial", draw)
+    decision = real_policy.choose_action(observation)
+    assert decision["action"] == action
+    assert_decision(real_policy, observation, decision, atol=1e-4)
