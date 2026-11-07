@@ -185,3 +185,65 @@ def test_no_available_actions(wiki_policy, observation):
 
     with pytest.raises(ValueError, match="no available actions"):
         wiki_policy.choose_action(observation)
+
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_mixed_id_prefixes(wiki_policy, observation, deterministic):
+    observation["actions"] = [
+        {"id": 0, "title": "Germany"},
+        {"id": 2, "title": "Italy"},
+        {"id": 10, "title": "Spain"},
+        {"id": 100, "title": "France"},
+    ]
+
+    action, rollout_log_prob = wiki_policy.choose_action(
+        observation, deterministic=deterministic
+    )
+
+    with torch.no_grad():
+        recomputed = wiki_policy.get_action_log_prob(
+            observation, action
+        )
+
+    assert action in {0, 2, 10, 100}
+    assert recomputed.item() == pytest.approx(
+        rollout_log_prob, abs=1e-4
+    )
+
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_training_log_prob_matches_rollout(
+    wiki_policy, observation, deterministic
+):
+    observation["actions"] = [
+        {"id": 0, "title": "Germany"},
+        {"id": 2, "title": "Italy"},
+        {"id": 7, "title": "Spain"},
+    ]
+
+    wiki_policy.model.eval()
+
+    action, rollout_log_prob = wiki_policy.choose_action(
+        observation, deterministic=deterministic
+    )
+
+    with torch.enable_grad():
+        training_log_prob = wiki_policy.get_action_log_prob(
+            observation, action
+        )
+
+    assert training_log_prob.requires_grad
+    assert torch.isfinite(training_log_prob).item()
+
+    recomputed = training_log_prob.detach().item()
+    ratio = torch.exp(
+        training_log_prob.detach() - rollout_log_prob
+    ).item()
+
+    print(
+        f"\ndeterministic={deterministic}, action={action}, "
+        f"log_prob_error={abs(recomputed - rollout_log_prob):.8f}, "
+        f"ratio={ratio:.8f}"
+    )
+
+    assert recomputed == pytest.approx(
+        rollout_log_prob, abs=1e-4
+    )
