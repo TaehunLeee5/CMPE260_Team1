@@ -15,6 +15,7 @@ class WikiGamePolicy:
         if max_input_tokens is not None and max_input_tokens < 1:
             raise ValueError("The input token budget must be positive.")
         self.system_prompt = SYSTEM_PROMPT
+        self.observation_template = OBSERVATION_TEMPLATE
         self.max_input_tokens = max_input_tokens
         device = "cuda" if torch.cuda.is_available() else "cpu"
         dtype = "auto"
@@ -41,7 +42,7 @@ class WikiGamePolicy:
         values["back_destination"] = (
             observation["back_destination"] if observation["back_available"] else "unavailable"
         )
-        return OBSERVATION_TEMPLATE.format(**values)
+        return self.observation_template.format(**values)
 
     def _tool_calls(self, observation):
         """Map each legal internal environment action to its native tool call."""

@@ -426,3 +426,72 @@ def test_goal_probe_skips_states_without_link_controls(policy, observation, monk
     assert result["summary"]["states_skipped"] == 1
     assert result["summary"]["direct_target_controls"] == 0
     assert result["summary"]["direct_target_selection_rate_percent"] is None
+
+
+def test_article_first_layout_changes_order_only(policy, observation, monkeypatch):
+    from evaluation.goal_sensitivity import ARTICLE_FIRST_TEMPLATE
+
+    current = policy.build_prompt(observation)
+    monkeypatch.setattr(policy, "observation_template", ARTICLE_FIRST_TEMPLATE)
+    candidate = policy.build_prompt(observation)
+    assert current.index("Target article:") < current.index("Current article text:")
+    assert candidate.index("Current article text:") < candidate.index("Target article:") < candidate.index("Available links:")
+    for value in [observation["text"], observation["target_title"], "0: Germany", "100: France", "Earth -> Europe"]:
+        assert value in current and value in candidate
+    assert_decision(policy, observation, policy.choose_action(observation, deterministic=True))
+
+
+def test_joint_text_fits_both_layouts_and_goals(policy, observation, monkeypatch):
+    from evaluation.goal_sensitivity import ARTICLE_FIRST_TEMPLATE, fixed_context
+
+    original_template = policy.observation_template
+    templates = [original_template, ARTICLE_FIRST_TEMPLATE]
+    targets = ["France", "A substantially longer goal title " * 3]
+    empty = {**observation, "text": "", "target_title": targets[1]}
+    limit = policy._encode_observation(empty)["input_ids"].shape[1] + 30
+    monkeypatch.setattr(policy, "max_input_tokens", limit)
+    observation["text"] = "Article context. " * 1000
+    visible = fixed_context(policy, observation, targets, templates)
+    assert policy.observation_template == original_template
+    output_tokens = max(map(len, policy._action_sequences(policy._tool_calls(visible)).values()))
+    try:
+        for template in templates:
+            policy.observation_template = template
+            for target in targets:
+                variant = {**visible, "target_title": target}
+                raw = policy._encode_observation(variant)["input_ids"]
+                prepared = policy._prepare_inputs(variant, output_tokens)["input_ids"]
+                assert raw.shape[1] <= limit
+                assert torch.equal(raw, prepared.cpu())
+    finally:
+        policy.observation_template = original_template
+
+
+def test_layout_comparison_pairs_states_and_restores_default(policy, observation):
+    from evaluation.goal_sensitivity import compare_layouts
+
+    original = policy.observation_template
+    state = {"start": "Earth", "target": "France", "step": 2, "observation": observation}
+    result = compare_layouts(policy, [state])
+    assert policy.observation_template == original
+    assert set(result["summary"]) == {"current", "article_first"}
+    before = result["layouts"]["current"]["states"][0]
+    after = result["layouts"]["article_first"]["states"][0]
+    assert before["fixed_context_sha256"] == after["fixed_context_sha256"]
+    assert before["control_targets"] == after["control_targets"]
+    assert [case["target_title"] for case in before["cases"]] == [case["target_title"] for case in after["cases"]]
+    assert json.loads(json.dumps(result)) == result
+
+
+def test_layout_comparison_restores_default_after_failure(policy, observation, monkeypatch):
+    from evaluation.goal_sensitivity import compare_layouts
+
+    original = policy.observation_template
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("Simulated model error")
+
+    monkeypatch.setattr(policy, "choose_action", fail)
+    with pytest.raises(RuntimeError, match="Simulated model error"):
+        compare_layouts(policy, [{"start": "Earth", "target": "France", "step": 2, "observation": observation}])
+    assert policy.observation_template == original
