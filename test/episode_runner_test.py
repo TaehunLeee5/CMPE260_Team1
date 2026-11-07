@@ -3,22 +3,30 @@ import math
 from copy import deepcopy
 
 import pytest
-import torch
 
 from environment.environment import WikiGameEnv
 from environment.episode_runner import EpisodeRunner
-from policy.llm_policy import WikiGamePolicy
 
 
-@pytest.fixture(scope="module")
-def wiki_policy():
-    """Load the real Qwen model once for this test file."""
-    return WikiGamePolicy()
+class TargetPolicy:
+    """Deterministic test policy: take the target, first link, or forced Back."""
+
+    def __init__(self):
+        self.deterministic_calls = []
+
+    def choose_action(self, observation, deterministic=False):
+        self.deterministic_calls.append(deterministic)
+        for action in observation["actions"]:
+            if action["title"] == observation["target_title"]:
+                return action["id"], 0.0
+        if observation["actions"]:
+            return observation["actions"][0]["id"], 0.0
+        return observation["back_action_id"], 0.0
 
 
 @pytest.fixture
-def runner(tmp_path, wiki_policy):
-    """Use the real policy with a small graph containing success and failure routes."""
+def runner(tmp_path):
+    """Exercise the runner on a small graph without model downloads or a GPU."""
     articles = {
         "Europe": {
             "title": "Europe",
@@ -46,13 +54,13 @@ def runner(tmp_path, wiki_policy):
     path = tmp_path / "articles.json"
     path.write_text(json.dumps(articles), encoding="utf-8")
     env = WikiGameEnv(path, max_clicks=2)
-    yield EpisodeRunner(env, wiki_policy)
+    yield EpisodeRunner(env, TargetPolicy())
     env.close()
 
 
 @pytest.mark.parametrize("deterministic", [False, True])
 def test_run_episode(runner, deterministic):
-    """Record a complete successful episode with matching actions and model scores."""
+    """Record the policy's decisions and forward its sampling-mode argument."""
     episode = runner.run_episode("Europe", "France", deterministic=deterministic)
 
     assert episode["start"] == "Europe"
@@ -74,9 +82,8 @@ def test_run_episode(runner, deterministic):
         assert current["outgoing"][step["action"]] == episode["path"][index + 1]
         assert isinstance(step["log_prob"], float)
         assert math.isfinite(step["log_prob"]) and step["log_prob"] <= 0
-        with torch.no_grad():
-            recomputed = runner.policy.get_action_log_prob(observation, step["action"])
-        assert recomputed.item() == pytest.approx(step["log_prob"], abs=1e-4)
+        assert step["log_prob"] == 0.0
+    assert runner.policy.deterministic_calls == [deterministic] * episode["clicks"]
 
     rewards = [step["reward"] for step in episode["steps"]]
     expected_reward = 1.05 if episode["clicks"] == 1 else 1.0
@@ -89,10 +96,10 @@ def test_run_episode(runner, deterministic):
 
 @pytest.mark.parametrize("start, reason, clicks", [
     ("Loop", "click_budget", 2),
-    ("Dead_end_start", "dead_end", 1),
+    ("Dead_end_start", "click_budget", 2),
 ])
 def test_failed_episode(runner, start, reason, clicks):
-    """Stop at the click budget or a dead end and keep all failed-route rewards zero."""
+    """Stop at the budget, allowing recovery from a page without links."""
     episode = runner.run_episode(start, "France")
 
     assert not episode["success"]
@@ -102,6 +109,12 @@ def test_failed_episode(runner, start, reason, clicks):
     assert len(episode["steps"]) == clicks
     assert episode["episode_return"] == 0
     assert all(step["reward"] == 0 for step in episode["steps"])
+    if start == "Dead_end_start":
+        assert episode["path"] == ["Dead_end_start", "Dead_end", "Dead_end_start"]
+        assert episode["navigation_stack"] == ["Dead_end_start"]
+        assert episode["steps"][1]["action"] == runner.env.back_action
+        assert episode["steps"][1]["observation"]["back_available"]
+        assert episode["steps"][1]["observation"]["history"] == ["Dead end start", "Dead end"]
 
 
 def test_runner_reuse(runner):
