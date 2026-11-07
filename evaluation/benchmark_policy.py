@@ -149,6 +149,7 @@ def benchmark(policy, states, repeats=2, atol=1e-4):
             "device": str(device), "dtype": str(policy.model.dtype),
             "torch": torch.__version__, "transformers": transformers.__version__,
             "max_input_tokens": policy.max_input_tokens, "atol": atol,
+            "observation_template": policy.observation_template,
         },
         "measurements": rows,
     }
@@ -178,6 +179,7 @@ def main():
         model_name=settings["model"], max_input_tokens=settings["max_input_tokens"],
     )
     actor.system_prompt = settings["system_prompt"]
+    actor.observation_template = settings.get("observation_template", actor.observation_template)
     print(f"Device: {actor.model.device}, dtype: {actor.model.dtype}. "
           f"Benchmarking {len(states)} states, {args.repeats} repeats per mode.", flush=True)
     result = benchmark(actor, states, args.repeats, args.atol)
