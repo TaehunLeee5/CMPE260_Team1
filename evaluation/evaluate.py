@@ -41,6 +41,8 @@ def evaluate(runner, tasks):
                 "start": episode["start"],
                 "target": episode["target"],
                 "path": episode["path"],
+                "tool_calls": [step["tool_call"] for step in episode["steps"]],
+                "navigation_stack": episode["navigation_stack"],
                 "success": episode["success"],
                 "clicks": episode["clicks"],
                 "episode_return": episode["episode_return"],
@@ -119,8 +121,8 @@ def main():
             "deterministic": True,
             "sample_seed": 42 if args.limit is not None else None,
             "max_input_tokens": policy.max_input_tokens,
-            "action_terminator": ":",
-            "action_end_token_id": policy.action_end_token_id,
+            "action_format": "qwen_tool_call",
+            "enable_thinking": False,
             "system_prompt": policy.system_prompt,
         }
 

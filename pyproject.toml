@@ -20,6 +20,10 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["test"]
 pythonpath = ["."]
+addopts = "-m 'not integration'"
+markers = [
+    "integration: loads pretrained Qwen weights; run explicitly with -m integration",
+]
 
 [tool.uv]
 package = false
