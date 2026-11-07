@@ -26,15 +26,15 @@ Replace the input paths if your folders are elsewhere. The script creates
 
 ## Create task splits
 
-After preprocessing, sample unique, reachable start–target pairs from the distance matrix:
+Create new task splits, excluding pairs from the existing splits in
+`data/processed/`:
 
 ```bash
-uv run data/splits.py --graph-folder "data/raw/graph" --num-tasks 1000
+uv run python -m data.splits --num-tasks 5000 --pilot-size 800
 ```
 
-Replace `1000` with the number of tasks you want to sample. The script saves
-`train.json`, `val.json`, and `test.json` in `data/processed/` using an 80/10/10 split.
-Each task contains `start`, `target`, and `shortest_distance`.
+The script saves train/validation/test splits (80/10/10), pilot subsets, and a
+manifest to `data/processed/experiment_5000/`. Existing directories are not overwritten.
 
 ## Run tests
 
