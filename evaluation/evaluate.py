@@ -103,7 +103,7 @@ def main():
         for task in tasks:
             env.validate_pair(task["start"], task["target"])
 
-        policy = WikiGamePolicy()
+        policy = WikiGamePolicy(max_input_tokens=4096)
         runner = EpisodeRunner(env, policy)
         report = evaluate(runner, tasks)
         report["settings"] = {
@@ -112,9 +112,13 @@ def main():
             "max_clicks": env.max_clicks,
             "deterministic": True,
             "sample_seed": 42 if args.limit is not None else None,
+            "max_input_tokens": policy.max_input_tokens,
+            "action_terminator": ":",
+            "action_end_token_id": policy.action_end_token_id,
+            "system_prompt": policy.system_prompt,
         }
 
-        output_path = Path("evaluation/results/baseline.json")
+        output_path = Path("evaluation/results/baseline_colon_4096.json")
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n",
                                encoding="utf-8")

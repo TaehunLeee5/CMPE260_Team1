@@ -22,6 +22,10 @@ class WikiGamePolicy:
             )
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        action_end_tokens = self.tokenizer.encode(":", add_special_tokens=False)
+        if len(action_end_tokens) != 1:
+            raise ValueError("The action terminator ':' must be one token.")
+        self.action_end_token_id = action_end_tokens[0]
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name, dtype=dtype
         )
@@ -49,7 +53,7 @@ class WikiGamePolicy:
         return {
             action["id"]: self.tokenizer.encode(
                 str(action["id"]), add_special_tokens=False
-            ) + [self.tokenizer.eos_token_id]
+            ) + [self.action_end_token_id]
             for action in actions
         }
 
@@ -130,7 +134,7 @@ class WikiGamePolicy:
         config = GenerationConfig(
             max_new_tokens=output_tokens,
             do_sample=not deterministic,
-            eos_token_id=self.tokenizer.eos_token_id,
+            eos_token_id=self.action_end_token_id,
             pad_token_id=self.tokenizer.eos_token_id,
             return_dict_in_generate=True,
             output_scores=True,
@@ -144,6 +148,7 @@ class WikiGamePolicy:
         result = self.model.generate(
             **inputs,
             generation_config=config,
+            # use_model_defaults=False,
             prefix_allowed_tokens_fn=restrict_tokens,
             logits_to_keep=1,
         )
