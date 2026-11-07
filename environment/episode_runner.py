@@ -25,15 +25,14 @@ class EpisodeRunner:
 
         while True:
             observation = self.env.get_llm_observation()
-            action, log_prob = self.policy.choose_action(
+            decision = self.policy.choose_action(
                 observation, deterministic=deterministic
             )
-            _, reward, terminated, truncated, info = self.env.step(action)
+            _, reward, terminated, truncated, info = self.env.step(decision["action"])
 
             steps.append({
+                **decision,
                 "observation": observation,
-                "action": action,
-                "log_prob": log_prob,
                 "reward": reward,
             })
 
