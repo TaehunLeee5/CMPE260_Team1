@@ -77,6 +77,18 @@ class WikiGamePolicy:
             if len(sequence) > len(prefix) and sequence[:len(prefix)] == prefix
         })
 
+    def _encode_observation(self, observation):
+        """Apply the native template before any text truncation or device transfer."""
+        return self.tokenizer.apply_chat_template(
+            [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": self.build_prompt(observation)},
+            ],
+            tools=TOOLS if observation["back_available"] else TOOLS[:1],
+            tokenize=True, add_generation_prompt=True, enable_thinking=False,
+            return_dict=True, return_tensors="pt",
+        )
+
     def _prepare_inputs(self, observation, output_tokens):
         """Preserve tools and state; shorten only current article text to fit."""
         limit = self.model.config.max_position_embeddings - output_tokens
@@ -86,16 +98,8 @@ class WikiGamePolicy:
             raise ValueError("The input token budget must be positive.")
         visible = observation.copy()
         text_tokens = self.tokenizer.encode(observation["text"], add_special_tokens=False)
-        tools = TOOLS if observation["back_available"] else TOOLS[:1]
         while True:
-            inputs = self.tokenizer.apply_chat_template(
-                [
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": self.build_prompt(visible)},
-                ],
-                tools=tools, tokenize=True, add_generation_prompt=True,
-                enable_thinking=False, return_dict=True, return_tensors="pt",
-            )
+            inputs = self._encode_observation(visible)
             overflow = inputs["input_ids"].shape[1] - limit
             if overflow <= 0:
                 return inputs.to(self.model.device)

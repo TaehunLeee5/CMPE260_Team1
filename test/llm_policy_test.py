@@ -334,3 +334,95 @@ def test_sampled_actions_match_complete_call_probabilities(policy, observation):
     for action, probability in expected.items():
         tolerance = 6 * math.sqrt(probability * (1 - probability) / draws) + 2 / draws
         assert abs(counts[action] / draws - probability) <= tolerance
+
+
+def test_goal_controls_exclude_visited_and_original_targets(observation):
+    from evaluation.goal_sensitivity import control_targets
+
+    assert [a["id"] for a in control_targets(observation)] == [0, 10]
+    assert [a["id"] for a in control_targets(observation, 1)] == [0]
+    observation["history"].append("Germany")
+    assert [a["id"] for a in control_targets(observation)] == [2, 10]
+
+
+def test_goal_variants_share_identical_truncated_text(policy, observation, monkeypatch):
+    from evaluation.goal_sensitivity import fixed_context
+
+    targets = ["France", "A much longer target title " * 4]
+    empty = {**observation, "text": "", "target_title": targets[1]}
+    limit = policy._encode_observation(empty)["input_ids"].shape[1] + 30
+    monkeypatch.setattr(policy, "max_input_tokens", limit)
+    observation["text"] = "Article context. " * 1000
+    original = deepcopy(observation)
+    visible = fixed_context(policy, observation, targets)
+    assert visible["text"] != observation["text"]
+    output_tokens = max(map(len, policy._action_sequences(policy._tool_calls(visible)).values()))
+    for title in targets:
+        variant = {**visible, "target_title": title}
+        encoded = policy._encode_observation(variant)["input_ids"]
+        prepared = policy._prepare_inputs(variant, output_tokens)["input_ids"]
+        assert encoded.shape[1] <= limit
+        assert torch.equal(encoded, prepared.cpu())  # No extra target-dependent text truncation.
+    assert observation == original
+
+
+def test_goal_probe_changes_only_target_and_keeps_original_state(policy, observation, monkeypatch):
+    from evaluation.goal_sensitivity import probe_goals
+
+    original = deepcopy(observation)
+    received = []
+    choose = policy.choose_action
+
+    def record(variant, deterministic=False):
+        received.append(deepcopy(variant))
+        return choose(variant, deterministic)
+
+    monkeypatch.setattr(policy, "choose_action", record)
+    result = probe_goals(policy, [{"start": "Earth", "target": "France", "step": 2, "observation": observation}])
+    assert len(received) == 3
+    contexts = [{k: v for k, v in obs.items() if k != "target_title"} for obs in received]
+    assert contexts[0] == contexts[1] == contexts[2]
+    assert observation == original
+    assert result["summary"]["direct_target_controls"] == 2
+    assert result["summary"]["states_probed"] == 1
+    assert json.loads(json.dumps(result)) == result
+
+
+def test_goal_probe_reports_probability_changes_without_argmax_change(policy, observation, monkeypatch):
+    from evaluation.goal_sensitivity import probe_goals
+
+    def probability(variant, action):
+        # The action distribution changes with the target, but action 0 stays largest.
+        return {
+            "France": {0: 0.8, 10: 0.01},
+            "Germany": {0: 0.9, 10: 0.01},
+            "Spain": {0: 0.6, 10: 0.3},
+        }[variant["target_title"]][action]
+
+    def choose(variant, deterministic=False):
+        return {
+            "action": 0, "tool_call": {"name": "follow_link", "arguments": {"link_id": 0}},
+            "log_prob": math.log(probability(variant, 0)), "prompt_ids": [1],
+        }
+
+    monkeypatch.setattr(policy, "choose_action", choose)
+    monkeypatch.setattr(policy, "get_action_log_prob", lambda variant, action: torch.tensor(math.log(probability(variant, action))))
+    result = probe_goals(policy, [{"start": "Earth", "target": "France", "step": 2, "observation": observation}])
+    assert result["summary"]["controls_changing_action"] == 0
+    assert result["summary"]["direct_target_selections"] == 1
+    assert result["states"][0]["cases"][2]["expected_log_prob_change"] > 3
+
+
+def test_goal_probe_skips_states_without_link_controls(policy, observation, monkeypatch):
+    from evaluation.goal_sensitivity import probe_goals
+
+    observation["actions"] = []  # Only Back is legal, so changing the goal cannot change the action.
+
+    def unexpected_call(*args, **kwargs):
+        raise AssertionError("An uninformative state should not call the model.")
+
+    monkeypatch.setattr(policy, "choose_action", unexpected_call)
+    result = probe_goals(policy, [{"start": "Earth", "target": "France", "step": 2, "observation": observation}])
+    assert result["summary"]["states_skipped"] == 1
+    assert result["summary"]["direct_target_controls"] == 0
+    assert result["summary"]["direct_target_selection_rate_percent"] is None

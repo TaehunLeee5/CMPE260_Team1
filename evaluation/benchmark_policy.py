@@ -1,5 +1,3 @@
-"""Compare standard uncached generation with forced-token skipping."""
-
 import argparse
 import json
 import math
