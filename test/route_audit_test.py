@@ -1,3 +1,5 @@
+"""Saved-route validation, including Back moves without reverse hyperlinks."""
+
 from copy import deepcopy
 import json
 from pathlib import Path
@@ -259,3 +261,17 @@ def test_cli_and_input_overwrite_protection(tmp_path, report, articles):
         assert run.returncode != 0
         assert "must not overwrite" in run.stderr
         assert destination.read_bytes() == before
+
+
+def test_benchmark_replays_selected_states(tmp_path, report, articles):
+    from environment.environment import WikiGameEnv
+    from evaluation.benchmark_policy import replay_states
+
+    path = tmp_path / "articles.json"
+    path.write_text(json.dumps(articles), encoding="utf-8")
+    env = WikiGameEnv(path, max_clicks=6)
+    states = replay_states(report, env, 3)
+    assert [state["step"] for state in states] == [1, 2, 4]
+    assert [state["observation"]["current_title"] for state in states] == ["Article A", "Article C", "Article B"]
+    assert [state["observation"]["back_available"] for state in states] == [False, True, True]
+    assert states[1]["observation"]["navigation_stack"] == ["Article A", "Article C"]

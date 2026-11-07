@@ -1,7 +1,7 @@
 import json
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from policy.prompt import OBSERVATION_TEMPLATE, SYSTEM_PROMPT, TOOLS
 
@@ -106,50 +106,56 @@ class WikiGamePolicy:
                 text_tokens, clean_up_tokenization_spaces=False,
             )
 
+    def _next_log_probs(self, prompt_ids, prefix, choices):
+        """Shared full-prefix calculation for rollout and gradient-enabled scoring."""
+        input_ids = torch.tensor(
+            [prompt_ids + prefix], device=self.model.device, dtype=torch.long,
+        )
+        logits = self.model(
+            input_ids=input_ids, attention_mask=torch.ones_like(input_ids),
+            use_cache=False, logits_to_keep=1,
+        ).logits[0, -1].float()
+        return torch.log_softmax(logits[choices], dim=-1)
+
     @torch.no_grad()
     def choose_action(self, observation, deterministic=False):
-        """Return a serializable decision; sample for rollouts, use greedy for evaluation.
+        """Query the model only at branching prefixes of the legal-call grammar.
 
-        All probabilities are under the same legal-prefix mask and temperature 1.
-        KV caching is disabled to match gradient-enabled prefix scoring.
+        Forced syntax has probability one and is appended without a forward pass.
+        Actual choices use the same uncached calculation as training, with
+        temperature 1 and no top-k/top-p filtering.
         """
         self.model.eval()
         calls = self._tool_calls(observation)
         sequences = self._action_sequences(calls)
-        output_tokens = max(map(len, sequences.values()))
-        inputs = self._prepare_inputs(observation, output_tokens)
+        inputs = self._prepare_inputs(observation, max(map(len, sequences.values())))
         prompt_ids = inputs["input_ids"][0].tolist()
-
-        def restrict_tokens(batch_id, input_ids):
-            return self._allowed_tokens(sequences, input_ids[len(prompt_ids):].tolist())
-
-        config = GenerationConfig(
-            max_new_tokens=output_tokens, do_sample=not deterministic,
-            eos_token_id=self.tokenizer.eos_token_id,
-            pad_token_id=self.tokenizer.eos_token_id,
-            return_dict_in_generate=True, output_scores=True, use_cache=False,
-        )
-        if not deterministic:
-            config.temperature, config.top_k, config.top_p = 1.0, 0, 1.0
-        result = self.model.generate(
-            **inputs, generation_config=config,
-            prefix_allowed_tokens_fn=restrict_tokens, logits_to_keep=1,
-        )
-        tokens = result.sequences[0, len(prompt_ids):].tolist()
+        tokens, token_choices, scores = [], [], []
+        for _ in range(max(map(len, sequences.values()))):
+            choices = self._allowed_tokens(sequences, tokens)
+            if not choices:
+                raise RuntimeError("Generation reached an invalid tool-call prefix.")
+            if len(choices) == 1:
+                token, score = choices[0], 0.0
+            else:
+                log_probs = self._next_log_probs(prompt_ids, tokens, choices)
+                index = log_probs.argmax().item() if deterministic else torch.multinomial(
+                    log_probs.exp(), num_samples=1,
+                ).item()
+                token, score = choices[index], log_probs[index].item()
+            tokens.append(token)
+            token_choices.append(choices)
+            scores.append(score)
+            if token == self.tokenizer.eos_token_id:
+                break
         action = next((a for a, sequence in sequences.items() if sequence == tokens), None)
         if action is None:
             raise RuntimeError("Generation did not produce a complete legal tool call.")
-        scores = self.model.compute_transition_scores(
-            result.sequences, result.scores, normalize_logits=True,
-        )[0]
         return {
-            "action": action,
-            "tool_call": calls[action],
-            "prompt_ids": prompt_ids,
-            "token_ids": tokens,
-            "token_choices": [self._allowed_tokens(sequences, tokens[:i]) for i in range(len(tokens))],
-            "token_log_probs": scores.tolist(),
-            "log_prob": scores.sum().item(),
+            "action": action, "tool_call": calls[action], "prompt_ids": prompt_ids,
+            "token_ids": tokens, "token_choices": token_choices,
+            "token_log_probs": scores,
+            "log_prob": torch.tensor(scores, device=self.model.device, dtype=torch.float32).sum().item(),
         }
 
     def get_token_log_probs(self, prompt_ids, token_ids, token_choices):
@@ -168,14 +174,8 @@ class WikiGamePolicy:
             if len(choices) == 1:
                 scores.append(zero)
                 continue
-            input_ids = torch.tensor(
-                [prompt_ids + token_ids[:position]], device=self.model.device, dtype=torch.long,
-            )
-            logits = self.model(
-                input_ids=input_ids, attention_mask=torch.ones_like(input_ids),
-                use_cache=False, logits_to_keep=1,
-            ).logits[0, -1].float()
-            scores.append(torch.log_softmax(logits[choices], dim=-1)[choices.index(token)])
+            log_probs = self._next_log_probs(prompt_ids, token_ids[:position], choices)
+            scores.append(log_probs[choices.index(token)])
         return torch.stack(scores)
 
     def get_action_log_prob(self, observation, action):

@@ -128,6 +128,8 @@ def main():
             "max_input_tokens": policy.max_input_tokens,
             "action_format": "qwen_tool_call",
             "enable_thinking": False,
+            "use_cache": False,
+            "decoder": "forced_token_skip",
             "system_prompt": policy.system_prompt,
         })
 

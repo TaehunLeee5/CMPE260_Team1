@@ -1,4 +1,7 @@
+"""Policy mechanics use a tiny random actor; integration tests load real Qwen."""
+
 from copy import deepcopy
+from collections import Counter
 import json
 import math
 import string
@@ -131,14 +134,7 @@ def test_model_sampling_defaults_do_not_change_policy(policy, observation, monke
 
 @pytest.mark.parametrize("action", [0, 10, 100, 300])
 def test_controlled_draw_covers_both_tools(policy, observation, monkeypatch, action):
-    tokens = iter(policy._action_sequences(policy._tool_calls(observation))[action])
-
-    def draw(probabilities, num_samples=1, **kwargs):
-        token = next(tokens)
-        assert probabilities[0, token] > 0
-        return torch.tensor([[token]], device=probabilities.device)
-
-    monkeypatch.setattr(torch, "multinomial", draw)
+    force_action(policy, observation, action, monkeypatch)
     decision = policy.choose_action(observation)
     assert decision["action"] == action
     assert_decision(policy, observation, decision)
@@ -162,7 +158,13 @@ def test_single_legal_call_has_probability_one(policy, observation, back_only):
         observation.update(back_available=False, back_action_id=None, back_destination=None)
         observation["actions"] = [{"id": 100, "title": "France"}]
         expected = 100
-    decision = policy.choose_action(observation)
+    forwards = []
+    hook = policy.model.register_forward_pre_hook(lambda module, inputs: forwards.append(1))
+    try:
+        decision = policy.choose_action(observation)
+    finally:
+        hook.remove()
+    assert forwards == []
     assert decision["action"] == expected
     assert decision["log_prob"] == 0
     assert_decision(policy, observation, decision)
@@ -249,20 +251,86 @@ def real_policy():
 def test_pretrained_rollout_and_training_match(real_policy, observation, deterministic):
     decision = real_policy.choose_action(observation, deterministic)
     assert_decision(real_policy, observation, decision, atol=1e-4)
-    print("\\nTool:", decision["tool_call"], "log probability:", decision["log_prob"])
+    print("Tool:", decision["tool_call"], "log probability:", decision["log_prob"])
 
 
 @pytest.mark.integration
 @pytest.mark.parametrize("action", [10, 100, 300])
-def test_pretrained_controlled_calls(real_policy, observation, monkeypatch, action):
-    tokens = iter(real_policy._action_sequences(real_policy._tool_calls(observation))[action])
-
-    def draw(probabilities, num_samples=1, **kwargs):
-        token = next(tokens)
-        assert probabilities[0, token] > 0
-        return torch.tensor([[token]], device=probabilities.device)
-
-    monkeypatch.setattr(torch, "multinomial", draw)
+@pytest.mark.parametrize("long_context", [False, True])
+def test_pretrained_controlled_calls(real_policy, observation, monkeypatch, action, long_context):
+    if long_context:
+        observation["text"] = "Article context. " * 2000
+    force_action(real_policy, observation, action, monkeypatch)
     decision = real_policy.choose_action(observation)
     assert decision["action"] == action
+    if long_context:
+        assert len(decision["prompt_ids"]) > 3000
     assert_decision(real_policy, observation, decision, atol=1e-4)
+
+
+
+def force_action(policy, observation, action, monkeypatch):
+    """Control draws at branching prefixes without changing their probabilities."""
+    sequences = policy._action_sequences(policy._tool_calls(observation))
+    tokens = sequences[action]
+    branches = []
+    for position, token in enumerate(tokens):
+        choices = policy._allowed_tokens(sequences, tokens[:position])
+        if len(choices) > 1:
+            branches.append((choices.index(token), len(choices)))
+    draws = iter(branches)
+
+    def draw(probabilities, num_samples=1, **kwargs):
+        index, size = next(draws)
+        assert probabilities.ndim == 1 and probabilities.numel() == size
+        assert probabilities[index] > 0
+        return torch.tensor([index], device=probabilities.device)
+
+    monkeypatch.setattr(torch, "multinomial", draw)
+
+
+def test_forward_passes_only_at_branching_prefixes(policy, observation):
+    forwards = []
+    hook = policy.model.register_forward_pre_hook(lambda module, inputs: forwards.append(1))
+    try:
+        decision = policy.choose_action(observation, deterministic=True)
+    finally:
+        hook.remove()
+    decisions = sum(len(choices) > 1 for choices in decision["token_choices"])
+    assert len(forwards) == decisions
+    assert decisions < len(decision["token_ids"])
+
+
+def test_standard_uncached_reference_agrees(policy, observation):
+    from evaluation.benchmark_policy import reference_decision
+
+    reference = reference_decision(policy, observation)
+    optimized = policy.choose_action(observation, deterministic=True)
+    assert reference["prompt_ids"] == optimized["prompt_ids"]
+    assert reference["token_ids"] == optimized["token_ids"]
+    assert reference["token_log_probs"] == pytest.approx(optimized["token_log_probs"], abs=1e-5)
+
+
+def test_benchmark_pairs_reference_and_optimized(policy, observation):
+    from evaluation.benchmark_policy import benchmark
+
+    result = benchmark(policy, [{"observation": observation}], repeats=1, atol=1e-5)
+    assert {row["decoder"] for row in result["measurements"]} == {"reference", "optimized"}
+    assert result["summary"]["all_probability_checks_passed"]
+    assert result["summary"]["all_greedy_calls_matched"]
+    assert result["summary"]["speedup"] > 0
+
+
+def test_sampled_actions_match_complete_call_probabilities(policy, observation):
+    with torch.no_grad():
+        expected = {
+            action: policy.get_action_log_prob(observation, action).exp().item()
+            for action in policy._tool_calls(observation)
+        }
+    draws = 128
+    with torch.random.fork_rng(devices=[]):
+        torch.random.default_generator.manual_seed(42)
+        counts = Counter(policy.choose_action(observation)["action"] for _ in range(draws))
+    for action, probability in expected.items():
+        tolerance = 6 * math.sqrt(probability * (1 - probability) / draws) + 2 / draws
+        assert abs(counts[action] / draws - probability) <= tolerance
