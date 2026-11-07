@@ -7,6 +7,7 @@ from tqdm import tqdm
 
 from environment.environment import WikiGameEnv
 from environment.episode_runner import EpisodeRunner
+from evaluation.audit_saved_routes import analyze_routes
 from policy.llm_policy import WikiGamePolicy
 
 
@@ -77,7 +78,12 @@ def evaluate(runner, tasks):
         "successful_path_length": average_clicks,
         "path_efficiency": path_efficiency,
     }
-    return {"summary": summary, "episodes": results}
+    report = {
+        "summary": summary, "episodes": results,
+        "settings": {"max_clicks": runner.env.max_clicks},
+    }
+    report["route_audit"] = analyze_routes(report, runner.env.articles)["summary"]
+    return report
 
 
 def main():
@@ -114,17 +120,16 @@ def main():
         policy = WikiGamePolicy(max_input_tokens=4096)
         runner = EpisodeRunner(env, policy)
         report = evaluate(runner, tasks)
-        report["settings"] = {
+        report["settings"].update({
             "model": policy.model.name_or_path,
             "tasks_file": str(args.tasks),
-            "max_clicks": env.max_clicks,
             "deterministic": True,
             "sample_seed": 42 if args.limit is not None else None,
             "max_input_tokens": policy.max_input_tokens,
             "action_format": "qwen_tool_call",
             "enable_thinking": False,
             "system_prompt": policy.system_prompt,
-        }
+        })
 
         output_path = args.output
         output_path.parent.mkdir(parents=True, exist_ok=True)

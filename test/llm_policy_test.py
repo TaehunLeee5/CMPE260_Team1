@@ -1,5 +1,3 @@
-"""Policy mechanics use a tiny random actor; integration tests load real Qwen."""
-
 from copy import deepcopy
 import json
 import math
