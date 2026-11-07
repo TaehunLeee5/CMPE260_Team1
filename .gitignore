@@ -32,6 +32,7 @@ htmlcov/
 /outputs/
 /tmp/
 *.log
+/evaluation/results/
 
 # Local secrets (keep the example configuration)
 .env
