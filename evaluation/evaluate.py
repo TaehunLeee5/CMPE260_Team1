@@ -87,6 +87,12 @@ def main():
                         help="Evaluate up to this many randomly selected tasks, using seed 42.")
     parser.add_argument("--max-clicks", type=int, default=20,
                         help="Click budget per game (default: 20).")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="Path for the evaluation results JSON.",
+    )
     args = parser.parse_args()
     if args.max_clicks < 1 or (args.limit is not None and args.limit < 1):
         parser.error("The click budget and task limit must be positive.")
@@ -118,7 +124,7 @@ def main():
             "system_prompt": policy.system_prompt,
         }
 
-        output_path = Path("evaluation/results/baseline_colon_4096.json")
+        output_path = args.output
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n",
                                encoding="utf-8")
