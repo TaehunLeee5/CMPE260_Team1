@@ -185,19 +185,21 @@ class WikiGamePolicy:
         Forced tokens contribute zero. Training controls model mode; keep dropout
         disabled when comparing rollout and training probabilities.
         """
+        return torch.stack(list(self.iter_token_log_probs(prompt_ids, token_ids, token_choices)))
+
+    def iter_token_log_probs(self, prompt_ids, token_ids, token_choices):
+        """Yield scores separately so training can backpropagate one branch at a time."""
         if not prompt_ids or not token_ids or len(token_ids) != len(token_choices):
             raise ValueError("Provide a prompt and matching token/mask sequences.")
-        scores = []
         zero = torch.zeros((), device=self.model.device, requires_grad=torch.is_grad_enabled())
         for position, (token, choices) in enumerate(zip(token_ids, token_choices)):
             if not choices or len(choices) != len(set(choices)) or token not in choices:
                 raise ValueError("Each recorded token must have a valid legal-token mask.")
             if len(choices) == 1:
-                scores.append(zero)
+                yield zero
                 continue
             log_probs = self._next_log_probs(prompt_ids, token_ids[:position], choices)
-            scores.append(log_probs[choices.index(token)])
-        return torch.stack(scores)
+            yield log_probs[choices.index(token)]
 
     def get_action_log_prob(self, observation, action):
         """Sum the masked token log probabilities of one complete legal call."""

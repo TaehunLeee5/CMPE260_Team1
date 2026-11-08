@@ -1,10 +1,9 @@
-"""Policy mechanics use a tiny random actor; integration tests load real Qwen."""
-
 from copy import deepcopy
 from collections import Counter
 import json
 import math
 import string
+import sys
 
 import pytest
 import torch
@@ -15,6 +14,7 @@ from transformers import PreTrainedTokenizerFast, Qwen3Config, Qwen3ForCausalLM
 from environment.environment import WikiGameEnv
 from environment.episode_runner import EpisodeRunner
 from policy.llm_policy import WikiGamePolicy
+from training.grpo import clipped_token_loss, group_advantages, grpo_update
 
 
 @pytest.fixture(scope="module")
@@ -603,6 +603,167 @@ def test_pretrained_lora_update(real_policy, observation, monkeypatch, tmp_path)
     finally:
         if isinstance(actor.model, PeftModel):
             actor.model = actor.model.unload()
+        for parameter, flag in original_flags:
+            parameter.requires_grad_(flag)
+        actor.model.eval()
+
+
+def controlled_grpo_group(actor, observation, monkeypatch):
+    """Synthetic outcomes isolate the optimizer math from navigation quality."""
+    group = []
+    for action, reward in [(10, 1.0), (300, 0.0)]:
+        force_action(actor, observation, action, monkeypatch)
+        group.append({
+            "start": "Europe", "target": "France", "episode_return": reward,
+            "steps": [actor.choose_action(observation)],
+        })
+    return group
+
+
+def test_streamed_grpo_matches_full_graph_update(policy, observation, monkeypatch):
+    actor = WikiGamePolicy(model=deepcopy(policy.model), tokenizer=policy.tokenizer)
+    actor.enable_lora()
+    actor.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    group = controlled_grpo_group(actor, observation, monkeypatch)
+    constant = deepcopy(group)
+    for episode in constant:
+        episode["episode_return"] = 0.0
+    groups = [group, constant]
+    reference = WikiGamePolicy(model=deepcopy(actor.model), tokenizer=policy.tokenizer)
+    reference.model.train()
+    loss = 0
+    advantages = group_advantages([1.0, 0.0])
+    for episode, advantage in zip(group, advantages):
+        step = episode["steps"][0]
+        current = reference.get_token_log_probs(step["prompt_ids"], step["token_ids"], step["token_choices"])
+        mask = torch.tensor([len(choices) > 1 for choices in step["token_choices"]])
+        old = torch.tensor(step["token_log_probs"])
+        # Two active routes and two zero-advantage routes: denominator remains four.
+        loss = loss + clipped_token_loss(current[mask], old[mask], advantage).mean() / 4
+    loss.backward()
+    expected = {name: p.grad.detach().clone() for name, p in reference.model.named_parameters() if p.grad is not None}
+    optimizer = torch.optim.AdamW((p for p in actor.model.parameters() if p.requires_grad), lr=1e-3, weight_decay=0)
+    step_optimizer = optimizer.step
+    captured = {}
+
+    def record_gradients():
+        captured.update({name: p.grad.detach().clone() for name, p in actor.model.named_parameters() if p.grad is not None})
+        step_optimizer()
+
+    monkeypatch.setattr(optimizer, "step", record_gradients)
+    frozen = [(p, p.detach().clone()) for p in actor.model.parameters() if not p.requires_grad]
+    result = grpo_update(actor, groups, optimizer, max_grad_norm=1e9, atol=1e-5)
+    assert captured.keys() == expected.keys()
+    for name in expected:
+        assert torch.allclose(captured[name], expected[name], atol=1e-6, rtol=1e-5), name
+    assert result["loss"] == pytest.approx(loss.item(), abs=1e-6)
+    assert result["optimizer_step_applied"] and result["adapters_changed"]
+    assert result["initial_probability_checks_passed"]
+    assert result["gradient_norm_before_clipping"] > 0
+    assert result["zero_variance_groups"] == 1 and result["routes"] == 4
+    assert all(torch.equal(p.detach(), original) for p, original in frozen)
+    assert not actor.model.training
+    assert json.loads(json.dumps(result, allow_nan=False)) == result
+
+
+def test_grpo_skips_constant_reward_groups(policy, observation, monkeypatch):
+    actor = WikiGamePolicy(model=deepcopy(policy.model), tokenizer=policy.tokenizer)
+    actor.enable_lora()
+    group = controlled_grpo_group(actor, observation, monkeypatch)
+    for episode in group:
+        episode["episode_return"] = 1.09
+    optimizer = torch.optim.AdamW((p for p in actor.model.parameters() if p.requires_grad), lr=1e-5)
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("Constant returns should not trigger scoring or an optimizer step.")
+
+    monkeypatch.setattr(actor, "_next_log_probs", unexpected)
+    monkeypatch.setattr(optimizer, "step", unexpected)
+    result = grpo_update(actor, [group], optimizer)
+    assert not result["optimizer_step_applied"]
+    assert result["initial_probability_checks_passed"] is None
+    assert result["zero_variance_groups"] == 1 and not optimizer.state
+
+
+def test_grpo_rejects_stale_probabilities_before_stepping(policy, observation, monkeypatch):
+    actor = WikiGamePolicy(model=deepcopy(policy.model), tokenizer=policy.tokenizer)
+    actor.enable_lora()
+    group = controlled_grpo_group(actor, observation, monkeypatch)
+    step = group[-1]["steps"][0]
+    position = next(i for i, choices in enumerate(step["token_choices"]) if len(choices) > 1)
+    step["token_log_probs"][position] -= 0.5
+    before = [(p, p.detach().clone()) for p in actor.model.parameters()]
+    optimizer = torch.optim.AdamW((p for p in actor.model.parameters() if p.requires_grad), lr=1e-5)
+    with pytest.raises(RuntimeError, match="Behavior log probabilities do not match"):
+        grpo_update(actor, [group], optimizer)
+    assert not optimizer.state
+    assert all(torch.equal(p.detach(), original) for p, original in before)
+    assert all(p.grad is None for p in actor.model.parameters())
+    assert not actor.model.training
+
+
+def test_grpo_cli_collects_audits_and_reports_update(policy, tmp_path, monkeypatch):
+    from training import grpo
+
+    actor = WikiGamePolicy(model=deepcopy(policy.model), tokenizer=policy.tokenizer)
+    articles = {
+        "Start": {"title": "Start", "text": "Start", "outgoing": ["Mid", "Trap"]},
+        "Mid": {"title": "Mid", "text": "Mid", "outgoing": ["Goal"]},
+        "Trap": {"title": "Trap", "text": "Trap", "outgoing": ["Trap"]},
+        "Goal": {"title": "Goal", "text": "Goal", "outgoing": ["Start"]},
+    }
+    article_path, tasks_path = tmp_path / "articles.json", tmp_path / "train.json"
+    article_path.write_text(json.dumps(articles), encoding="utf-8")
+    tasks_path.write_text(json.dumps([
+        {"start": "Start", "target": "Goal", "shortest_distance": 2},
+        {"start": "Mid", "target": "Goal", "shortest_distance": 1},
+    ]), encoding="utf-8")
+    output = tmp_path / "run"
+    monkeypatch.setattr(grpo, "WikiGamePolicy", lambda **kwargs: actor)
+    monkeypatch.setattr(sys, "argv", [
+        "grpo", "--tasks", str(tasks_path), "--articles", str(article_path),
+        "--distance", "2", "--limit", "1", "--rollouts", "4", "--max-clicks", "2", "--output", str(output),
+    ])
+    grpo.main()
+    report = json.loads((output / "report.json").read_text(encoding="utf-8"))
+    assert report["route_audit"]["all_recorded_transitions_and_returns_valid"]
+    assert report["group_summary"]["total_rollouts"] == 4
+    assert report["settings"]["algorithm"] == "constrained_token_grpo"
+    assert report["settings"]["kl_beta"] == 0
+    assert all(e["start"] == "Start" and "steps" not in e for e in report["episodes"])
+    assert report["update"]["optimizer_step_applied"] == bool(report["group_summary"]["groups_with_reward_variation"])
+    if report["update"]["optimizer_step_applied"]:
+        assert (output / "adapter" / "adapter_model.safetensors").exists()
+    else:
+        assert report["adapter_checkpoint"] is None
+    with pytest.raises(SystemExit):
+        grpo.main()  # Existing run directories cannot be overwritten.
+
+
+@pytest.mark.integration
+def test_pretrained_grpo_checkpointed_long_context(real_policy, observation, monkeypatch):
+    actor = real_policy
+    original_flags = [(p, p.requires_grad) for p in actor.model.parameters()]
+    observation["text"] = "Article context. " * 2000
+    try:
+        actor.enable_lora()
+        actor.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        group = controlled_grpo_group(actor, observation, monkeypatch)
+        assert all(len(e["steps"][0]["prompt_ids"]) > 3000 for e in group)
+        optimizer = torch.optim.AdamW((p for p in actor.model.parameters() if p.requires_grad), lr=1e-5, weight_decay=0)
+        if actor.model.device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(actor.model.device)
+        report = grpo_update(actor, [group], optimizer)
+        assert report["optimizer_step_applied"] and report["adapters_changed"]
+        assert report["initial_probability_checks_passed"]
+        assert report["base_parameter_versions_unchanged"]
+        if actor.model.device.type == "cuda":
+            report["peak_allocated_gib"] = torch.cuda.max_memory_allocated(actor.model.device) / 2**30
+        print("Checkpointed GRPO check:", json.dumps(report, indent=2))
+    finally:
+        if isinstance(actor.model, PeftModel):
+            actor.model = actor.model.unload()
+        actor.model.gradient_checkpointing_disable()
         for parameter, flag in original_flags:
             parameter.requires_grad_(flag)
         actor.model.eval()
