@@ -332,3 +332,27 @@ def test_cli_rejects_unusable_distance_before_loading_model(tmp_path, monkeypatc
         evaluation.main()
     assert error.value.code == 2
     assert message in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("config_only", [False, True])
+def test_cli_rejects_missing_adapter_weights_before_loading_model(tmp_path, monkeypatch, capsys,
+                                                                config_only):
+    from evaluation import evaluate as evaluation
+
+    adapter = tmp_path / "adapter"
+    if config_only:
+        adapter.mkdir()
+        (adapter / "adapter_config.json").write_text("{}", encoding="utf-8")
+
+    def unexpected_model(**kwargs):
+        raise AssertionError("An invalid adapter path should fail before model loading.")
+
+    monkeypatch.setattr(evaluation, "WikiGamePolicy", unexpected_model)
+    monkeypatch.setattr(sys, "argv", [
+        "evaluate", "--tasks", str(tmp_path / "train.json"),
+        "--adapter", str(adapter), "--output", str(tmp_path / "out.json"),
+    ])
+    with pytest.raises(SystemExit) as error:
+        evaluation.main()
+    assert error.value.code == 2
+    assert "--adapter must contain" in capsys.readouterr().err

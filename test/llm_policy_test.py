@@ -571,6 +571,16 @@ def test_lora_initialization_update_and_checkpoint(policy, observation, monkeypa
     force_action(reloaded, observation, 10, monkeypatch)
     assert_decision(reloaded, observation, reloaded.choose_action(observation))
 
+    inference = WikiGamePolicy(model=deepcopy(policy.model), tokenizer=policy.tokenizer,
+                               adapter_path=checkpoint)
+    assert not inference.model.training
+    assert all(not p.requires_grad for p in inference.model.parameters())
+    with torch.no_grad():
+        score = inference.get_token_log_probs(
+            decision["prompt_ids"], decision["token_ids"], decision["token_choices"],
+        ).sum().item()
+    assert score == pytest.approx(report["log_prob_after"], abs=1e-5)
+
 
 @pytest.mark.integration
 def test_pretrained_lora_update(real_policy, observation, monkeypatch, tmp_path):
@@ -585,8 +595,9 @@ def test_pretrained_lora_update(real_policy, observation, monkeypatch, tmp_path)
         report = check_lora_update(actor, observation, decision, atol=1e-4)
         checkpoint = tmp_path / "adapter"
         actor.model.save_pretrained(checkpoint, save_embedding_layers=False)
-        actor.model = PeftModel.from_pretrained(actor.model.unload(), checkpoint, is_trainable=True)
-        actor.model.eval()
+        actor.model = WikiGamePolicy(model=actor.model.unload(), tokenizer=actor.tokenizer,
+                                     adapter_path=checkpoint).model
+        assert all(not p.requires_grad for p in actor.model.parameters())
         with torch.no_grad():
             reloaded = actor.get_token_log_probs(
                 decision["prompt_ids"], decision["token_ids"], decision["token_choices"],
@@ -767,3 +778,66 @@ def test_pretrained_grpo_checkpointed_long_context(real_policy, observation, mon
         for parameter, flag in original_flags:
             parameter.requires_grad_(flag)
         actor.model.eval()
+
+
+def test_evaluation_cli_loads_trained_adapter_on_identical_tasks(policy, observation, tmp_path, monkeypatch):
+    from evaluation import evaluate as evaluation
+
+    actor = WikiGamePolicy(model=deepcopy(policy.model), tokenizer=policy.tokenizer)
+    with monkeypatch.context() as draws:
+        force_action(actor, observation, 10, draws)
+        decision = actor.choose_action(observation)
+    trained = check_lora_update(actor, observation, decision, atol=1e-5)
+    checkpoint = tmp_path / "adapter"
+    actor.model.save_pretrained(checkpoint, save_embedding_layers=False)
+
+    articles = {
+        "Europe": {"title": "Europe", "text": "Europe", "outgoing": ["Germany", "France"]},
+        "Germany": {"title": "Germany", "text": "Germany", "outgoing": ["France"]},
+        "France": {"title": "France", "text": "France", "outgoing": ["Europe"]},
+    }
+    article_path = tmp_path / "articles.json"
+    article_path.write_text(json.dumps(articles), encoding="utf-8")
+    task_path = tmp_path / "val.json"
+    task_path.write_text(json.dumps([
+        {"start": "Europe", "target": "France", "shortest_distance": 1},
+        {"start": "Germany", "target": "France", "shortest_distance": 1},
+    ]), encoding="utf-8")
+    loaded = []
+
+    def make_policy(**kwargs):
+        model = WikiGamePolicy(model=deepcopy(policy.model), tokenizer=policy.tokenizer, **kwargs)
+        loaded.append(model)
+        return model
+
+    monkeypatch.setattr(evaluation, "WikiGamePolicy", make_policy)
+    monkeypatch.setattr(evaluation, "WikiGameEnv", lambda **kwargs: WikiGameEnv(article_path, **kwargs))
+    reports = []
+    for label, adapter_args in [("base", []), ("trained", ["--adapter", str(checkpoint)])]:
+        output = tmp_path / f"{label}.json"
+        monkeypatch.setattr(sys, "argv", [
+            "evaluate", "--tasks", str(task_path), "--limit", "1", "--seed", "42",
+            "--max-clicks", "2", "--output", str(output), *adapter_args,
+        ])
+        evaluation.main()
+        reports.append(json.loads(output.read_text(encoding="utf-8")))
+
+    base, adapted = reports
+    assert base["settings"]["adapter"] is None and base["settings"]["adapter_sha256"] is None
+    assert not isinstance(loaded[0].model, PeftModel)
+    assert adapted["settings"]["adapter"] == str(checkpoint)
+    hashes = adapted["settings"]["adapter_sha256"]
+    assert set(hashes) == {"adapter_config.json", "adapter_model.safetensors"}
+    assert all(len(value) == 64 for value in hashes.values())
+    assert [(e["start"], e["target"]) for e in base["episodes"]] == [
+        (e["start"], e["target"]) for e in adapted["episodes"]
+    ]
+    assert all(report["route_audit"]["all_recorded_transitions_and_returns_valid"] for report in reports)
+    assert all(report["settings"]["deterministic"] for report in reports)
+    assert not loaded[1].model.training
+    assert all(not p.requires_grad for p in loaded[1].model.parameters())
+    with torch.no_grad():
+        score = loaded[1].get_token_log_probs(
+            decision["prompt_ids"], decision["token_ids"], decision["token_choices"],
+        ).sum().item()
+    assert score == pytest.approx(trained["log_prob_after"], abs=1e-5)

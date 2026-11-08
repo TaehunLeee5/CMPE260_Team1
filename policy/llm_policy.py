@@ -11,8 +11,8 @@ class WikiGamePolicy:
     """Generate one legal Qwen tool call and retain its token probabilities."""
 
     def __init__(self, model_name="Qwen/Qwen3-1.7B", max_input_tokens=4096,
-                 *, model=None, tokenizer=None):
-        """Load the actor, or accept an existing model/tokenizer for tests and adapters."""
+                 *, model=None, tokenizer=None, adapter_path=None):
+        """Load the actor or injected model, optionally adding a frozen local adapter."""
         if max_input_tokens is not None and max_input_tokens < 1:
             raise ValueError("The input token budget must be positive.")
         self.system_prompt = SYSTEM_PROMPT
@@ -30,6 +30,10 @@ class WikiGamePolicy:
         )
         if model is None:
             self.model.to(device)
+        if adapter_path is not None:
+            self.model = PeftModel.from_pretrained(
+                self.model, adapter_path, is_trainable=False, local_files_only=True,
+            )
         self.model.eval()
 
     def enable_lora(self, rank=8, alpha=16):

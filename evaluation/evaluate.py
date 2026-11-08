@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import random
 from pathlib import Path
@@ -148,6 +149,8 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate or sample the Qwen Wiki Game policy.")
     parser.add_argument("--tasks", type=Path, required=True,
                         help="JSON tasks with start, target, and shortest_distance.")
+    parser.add_argument("--adapter", type=Path,
+                        help="Local PEFT adapter directory; omit to evaluate the base model.")
     parser.add_argument("--limit", type=int,
                         help="Select up to this many unique tasks using --seed.")
     parser.add_argument("--distance", type=int,
@@ -174,6 +177,16 @@ def main():
     if not 0 <= args.seed < 2**32:
         parser.error("--seed must be between 0 and 2**32 - 1.")
 
+    adapter_hashes = None
+    if args.adapter is not None:
+        config = args.adapter / "adapter_config.json"
+        weights = [args.adapter / name for name in ("adapter_model.safetensors", "adapter_model.bin")
+                   if (args.adapter / name).is_file()]
+        if not config.is_file() or not weights:
+            parser.error("--adapter must contain adapter_config.json and PEFT adapter weights.")
+        adapter_hashes = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                          for path in [config, *weights]}
+
     with args.tasks.open(encoding="utf-8") as file:
         tasks = json.load(file)
     if not isinstance(tasks, list) or not tasks:
@@ -190,13 +203,15 @@ def main():
         for task in tasks:
             env.validate_pair(task["start"], task["target"])
 
-        policy = WikiGamePolicy(max_input_tokens=4096)
+        policy = WikiGamePolicy(max_input_tokens=4096, adapter_path=args.adapter)
         runner = EpisodeRunner(env, policy)
         report = evaluate(
             runner, tasks, deterministic=not args.sample, rollouts=args.rollouts, seed=args.seed,
         )
         report["settings"].update({
             "model": policy.model.name_or_path,
+            "adapter": str(args.adapter) if args.adapter is not None else None,
+            "adapter_sha256": adapter_hashes,
             "tasks_file": str(args.tasks),
             "distance_filter": args.distance,
             "sample_seed": args.seed if args.limit is not None else None,
