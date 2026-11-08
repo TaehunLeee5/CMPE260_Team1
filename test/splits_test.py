@@ -1,8 +1,98 @@
+import hashlib
 import json
+from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
 from data import splits
+
+
+@pytest.fixture
+def graph():
+    ids = [f"Article{i}" for i in range(8)]
+    matrix = ["".join("0" if i == j else "1" for j in range(8)) for i in range(8)]
+    return ids, matrix
+
+
+def test_excluded_pairs_and_capacity(graph):
+    ids, matrix = graph
+    blocked = {(ids[0], ids[1]), (ids[1], ids[0])}
+    tasks, eligibility = splits.sample_tasks(ids, matrix, 54, blocked)
+
+    assert len(tasks) == len(splits.pair_set(tasks)) == 54
+    assert not splits.pair_set(tasks) & blocked
+    assert all(t["start"] != t["target"] and t["shortest_distance"] == 1 for t in tasks)
+    assert eligibility == {
+        "reachable_pairs": 56, "excluded_reachable_pairs": 2, "eligible_pairs": 54,
+    }
+    assert splits.sample_tasks(ids, matrix, 54, blocked)[0] == tasks
+    with pytest.raises(ValueError, match="54 eligible pairs"):
+        splits.sample_tasks(ids, matrix, 55, blocked)
+
+
+def test_pilot_subsets_and_overlap_detection(graph):
+    ids, matrix = graph
+    tasks, _ = splits.sample_tasks(ids, matrix, 40)
+    partition = splits.split_tasks(tasks, pilot_size=12)
+    splits.verify_splits(partition, blocked=set())
+
+    assert {name: len(rows) for name, rows in partition.items()} == {
+        "train": 32, "val": 4, "test": 4, "train_pilot": 12, "val_pilot": 4,
+    }
+    assert splits.pair_set(partition["train_pilot"]) <= splits.pair_set(partition["train"])
+    assert splits.pair_set(partition["val_pilot"]) <= splits.pair_set(partition["val"])
+    partition["test"][0] = partition["train"][0]
+    with pytest.raises(ValueError, match="Overlap"):
+        splits.verify_splits(partition, blocked=set())
+
+
+def test_cli_manifest_and_no_overwrite(tmp_path, graph):
+    ids, matrix = graph
+    graph_folder = tmp_path / "graph"
+    graph_folder.mkdir()
+    (graph_folder / "articles.tsv").write_text("\n".join(ids), encoding="utf-8")
+    (graph_folder / "shortest-path-distance-matrix.txt").write_text(
+        "\n".join(matrix), encoding="utf-8",
+    )
+    order = tmp_path / "article_order.json"
+    order.write_text(json.dumps(ids), encoding="utf-8")
+    previous = tmp_path / "previous"
+    previous.mkdir()
+    for name in ["train", "val", "test"]:
+        rows = [{"start": ids[0], "target": ids[1]}] if name == "train" else []
+        (previous / f"{name}.json").write_text(json.dumps(rows), encoding="utf-8")
+    output = tmp_path / "experiment"
+    args = [
+        sys.executable, "-m", "data.splits",
+        "--graph-folder", str(graph_folder), "--article-order", str(order),
+        "--previous-splits", str(previous), "--output", str(output),
+        "--num-tasks", "40", "--pilot-size", "12",
+    ]
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(args, cwd=root, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["excluded_previous_pair_count"] == 1
+    assert all(manifest["checks"].values())
+    all_pairs = set()
+    for name, entry in manifest["splits"].items():
+        path = output / entry["file"]
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == entry["sha256"]
+        rows = json.loads(path.read_text(encoding="utf-8"))
+        assert len(rows) == entry["count"]
+        if name in {"train", "val", "test"}:
+            all_pairs.update(splits.pair_set(rows))
+    assert len(all_pairs) == 40
+    assert (ids[0], ids[1]) not in all_pairs
+
+    before = {path.name: path.read_bytes() for path in output.iterdir()}
+    retry = subprocess.run(args, cwd=root, capture_output=True, text=True)
+    assert retry.returncode != 0
+    assert "already exists" in retry.stderr
+    assert {path.name: path.read_bytes() for path in output.iterdir()} == before
+
 
 
 def test_read_lines(tmp_path):
@@ -35,7 +125,7 @@ def test_sample_tasks():
         row = [str(target - start) if target >= start else "_" for target in range(10)]
         matrix.append("".join(row))
 
-    tasks = splits.sample_tasks(article_ids, matrix, 45)
+    tasks, _ = splits.sample_tasks(article_ids, matrix, 45)
 
     assert len(tasks) == 45
     assert len({(task["start"], task["target"]) for task in tasks}) == 45
@@ -45,35 +135,6 @@ def test_sample_tasks():
         assert target > start
         assert task["shortest_distance"] == target - start
     assert {"start": "Article0", "target": "Article9", "shortest_distance": 9} in tasks
-    assert splits.sample_tasks(article_ids, matrix, 45) == tasks
+    assert splits.sample_tasks(article_ids, matrix, 45)[0] == tasks
     with pytest.raises(ValueError):
         splits.sample_tasks(article_ids, matrix, 46)
-
-
-def test_split_tasks():
-    """Create repeatable 80/10/10 splits with each task appearing once."""
-    tasks = [
-        {"start": f"A{i}", "target": "Goal", "shortest_distance": 1}
-        for i in range(10)
-    ]
-
-    task_splits = splits.split_tasks(tasks)
-
-    assert len(task_splits["train"]) == 8
-    assert len(task_splits["val"]) == 1
-    assert len(task_splits["test"]) == 1
-    all_tasks = task_splits["train"] + task_splits["val"] + task_splits["test"]
-    assert sorted(task["start"] for task in all_tasks) == [f"A{i}" for i in range(10)]
-    assert splits.split_tasks(tasks) == task_splits
-
-
-def test_save_splits(tmp_path):
-    """Save train, validation, and test tasks as JSON files."""
-    task = {"start": "A", "target": "C", "shortest_distance": 2}
-    task_splits = {"train": [task], "val": [], "test": []}
-    output = tmp_path / "splits"
-
-    splits.save_splits(task_splits, output)
-
-    for name, tasks in task_splits.items():
-        assert json.loads((output / f"{name}.json").read_text(encoding="utf-8")) == tasks

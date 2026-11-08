@@ -11,7 +11,9 @@ class WikiGameEnv(gym.Env):
 
     Gym observations contain fixed-size numeric article IDs and padding.
     Use get_llm_observation() for readable titles and full current article text.
-    Only the current article's text is exposed. Actions index its outgoing links.
+    Only the current article's text is exposed. Forward actions index its
+    outgoing links; back_action returns to the previous navigation-stack entry.
+    Both kinds of move consume one click. The full visited route is retained.
     The caller supplies start and target IDs through reset options.
 
     Intermediate steps and failed episodes receive zero reward. Success earns
@@ -43,7 +45,8 @@ class WikiGameEnv(gym.Env):
         self.max_links = max(len(a["outgoing"]) for a in self.articles.values())
         if self.max_links == 0:
             raise ValueError("The graph has no outgoing links.")
-        self.action_space = spaces.Discrete(self.max_links)
+        self.back_action = self.max_links
+        self.action_space = spaces.Discrete(self.max_links + 1)
         last_index = len(self.article_ids) - 1
         self.observation_space = spaces.Dict({
             "current": spaces.Discrete(len(self.article_ids)),
@@ -51,6 +54,7 @@ class WikiGameEnv(gym.Env):
             "remaining_clicks": spaces.Discrete(max_clicks + 1),
             "links": spaces.Box(-1, last_index, (self.max_links,), dtype=np.int32),
             "history": spaces.Box(-1, last_index, (history_size,), dtype=np.int32),
+            "navigation_stack": spaces.Box(-1, last_index, (max_clicks + 1,), dtype=np.int32),
         })
         self.current = None
         self.target = None
@@ -79,6 +83,7 @@ class WikiGameEnv(gym.Env):
         self.current = start
         self.target = target
         self.history = [start]
+        self.navigation_stack = [start]
         self.clicks = 0
         self.episode_return = 0.0
         self.reason = ""
@@ -86,10 +91,11 @@ class WikiGameEnv(gym.Env):
         return self.get_observation(), self.get_info()
 
     def action_masks(self):
-        """Return True for valid local link IDs and False for padded or terminal actions."""
-        mask = np.zeros(self.max_links, dtype=bool)
+        """Allow current links and Back when there is a previous stack entry."""
+        mask = np.zeros(self.action_space.n, dtype=bool)
         if not self.done:
             mask[:len(self.articles[self.current]["outgoing"])] = True
+            mask[self.back_action] = len(self.navigation_stack) > 1
         return mask
 
     def get_observation(self):
@@ -102,19 +108,24 @@ class WikiGameEnv(gym.Env):
         history = np.full(self.history_size, -1, dtype=np.int32)
         for index, article_id in enumerate(self.history[-self.history_size:]):
             history[index] = self.article_index[article_id]
+        navigation_stack = np.full(self.max_clicks + 1, -1, dtype=np.int32)
+        for index, article_id in enumerate(self.navigation_stack):
+            navigation_stack[index] = self.article_index[article_id]
         return {
             "current": self.article_index[self.current],
             "target": self.article_index[self.target],
             "remaining_clicks": self.max_clicks - self.clicks,
             "links": links,
             "history": history,
+            "navigation_stack": navigation_stack,
         }
 
     def get_llm_observation(self):
-        """Return full current text, visible link titles, recent history, target, and budget."""
+        """Return visible content, full route, navigation stack, and Back availability."""
         if self.current is None:
             raise gym.error.ResetNeeded("Call reset() before requesting an observation.")
         actions = []
+        back_available = not self.done and len(self.navigation_stack) > 1
         if not self.done:
             for index, article_id in enumerate(self.articles[self.current]["outgoing"]):
                 actions.append({"id": index, "title": self.articles[article_id]["title"]})
@@ -123,7 +134,13 @@ class WikiGameEnv(gym.Env):
             "target_title": self.articles[self.target]["title"],
             "text": self.articles[self.current]["text"],
             "actions": actions,
-            "history": [self.articles[a]["title"] for a in self.history[-self.history_size:]],
+            "history": [self.articles[a]["title"] for a in self.history],
+            "navigation_stack": [self.articles[a]["title"] for a in self.navigation_stack],
+            "back_available": back_available,
+            "back_destination": (
+                self.articles[self.navigation_stack[-2]]["title"] if back_available else None
+            ),
+            "back_action_id": self.back_action if back_available else None,
             "remaining_clicks": self.max_clicks - self.clicks,
         }
 
@@ -137,10 +154,11 @@ class WikiGameEnv(gym.Env):
             "episode_return": self.episode_return,
             "reason": self.reason,
             "path": list(self.history),
+            "navigation_stack": list(self.navigation_stack),
         }
 
     def step(self, action):
-        """Follow a link and give a terminal reward only when the target is reached.
+        """Follow a link or go back, charging one click and retaining the full route.
 
         Success earns 1 + 0.1 * remaining_clicks / max_clicks. All other
         rewards are zero. Return observation, reward, terminated, truncated,
@@ -155,15 +173,18 @@ class WikiGameEnv(gym.Env):
         self.clicks += 1
         reward = 0.0
 
-        if action >= len(links):
+        if not self.action_masks()[action]:
             self.reason = "invalid_action"
         else:
-            self.current = links[action]
+            if action == self.back_action:
+                self.navigation_stack.pop()
+                self.current = self.navigation_stack[-1]
+            else:
+                self.current = links[action]
+                self.navigation_stack.append(self.current)
             self.history.append(self.current)
             if self.current == self.target:
                 self.reason = "success"
-            elif not self.articles[self.current]["outgoing"]:
-                self.reason = "dead_end"
             elif self.clicks >= self.max_clicks:
                 self.reason = "click_budget"
 
