@@ -8,6 +8,7 @@ import string
 
 import pytest
 import torch
+from peft import PeftModel
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 from transformers import PreTrainedTokenizerFast, Qwen3Config, Qwen3ForCausalLM
 
@@ -495,3 +496,113 @@ def test_layout_comparison_restores_default_after_failure(policy, observation, m
     with pytest.raises(RuntimeError, match="Simulated model error"):
         compare_layouts(policy, [{"start": "Earth", "target": "France", "step": 2, "observation": observation}])
     assert policy.observation_template == original
+
+
+def check_lora_update(actor, observation, decision, *, atol):
+    """Check training plumbing with one controlled likelihood step, not an RL update."""
+    actor.enable_lora()
+    assert_decision(actor, observation, decision, atol=atol)
+    config = actor.model.peft_config["default"]
+    assert config.r == 8 and config.lora_alpha == 16 and config.lora_dropout == 0
+    trainable = {name: p for name, p in actor.model.named_parameters() if p.requires_grad}
+    assert trainable and all("lora_" in name for name in trainable)
+    frozen = [(p, p._version) for p in actor.model.parameters() if not p.requires_grad]
+    initial = {name: p.detach().clone() for name, p in trainable.items()}
+    optimizer = torch.optim.AdamW(trainable.values(), lr=1e-3, weight_decay=0.0)
+    actor.model.zero_grad(set_to_none=True)
+    scores = actor.get_token_log_probs(
+        decision["prompt_ids"], decision["token_ids"], decision["token_choices"],
+    )
+    loss = -scores.sum()
+    assert torch.isfinite(loss)
+    loss.backward()
+    gradients = [p.grad for p in trainable.values() if p.grad is not None]
+    assert gradients and all(torch.isfinite(g).all() for g in gradients)
+    assert any(torch.count_nonzero(g).item() for g in gradients)
+    assert all(p.grad is None for p, _ in frozen)
+    grad_norm = torch.nn.utils.clip_grad_norm_(trainable.values(), 1.0, error_if_nonfinite=True)
+    optimizer.step()
+    assert any(not torch.equal(p.detach(), initial[name]) for name, p in trainable.items())
+    assert all(p._version == version for p, version in frozen)
+    assert all(torch.isfinite(p).all() for p in trainable.values())
+    actor.model.zero_grad(set_to_none=True)
+    with torch.no_grad():
+        updated = actor.get_token_log_probs(
+            decision["prompt_ids"], decision["token_ids"], decision["token_choices"],
+        ).sum().item()
+    assert math.isfinite(updated)
+    return {
+        "trainable_parameters": sum(p.numel() for p in trainable.values()),
+        "total_parameters": sum(p.numel() for p in actor.model.parameters()),
+        "initialization_and_rollout_probability_checks_passed": True,
+        "base_gradients_absent": True, "base_parameter_versions_unchanged": True,
+        "adapters_changed": True, "gradient_norm_before_clipping": grad_norm.item(),
+        "log_prob_before": decision["log_prob"], "log_prob_after": updated,
+    }
+
+
+def test_lora_initialization_update_and_checkpoint(policy, observation, monkeypatch, tmp_path):
+    actor = WikiGamePolicy(model=deepcopy(policy.model), tokenizer=policy.tokenizer)
+    original_weights = [(p, p.detach().clone()) for p in actor.model.parameters()]
+    force_action(actor, observation, 10, monkeypatch)
+    decision = actor.choose_action(observation)
+    report = check_lora_update(actor, observation, decision, atol=1e-5)
+    assert report["log_prob_after"] > report["log_prob_before"]
+    assert all(torch.equal(p.detach(), original) for p, original in original_weights)
+    with pytest.raises(ValueError, match="already has adapters"):
+        actor.enable_lora()
+
+    checkpoint = tmp_path / "adapter"
+    actor.model.save_pretrained(checkpoint, save_embedding_layers=False)
+    assert (checkpoint / "adapter_config.json").is_file()
+    assert (checkpoint / "adapter_model.safetensors").is_file()
+    assert not (checkpoint / "model.safetensors").exists()
+    base = actor.model.unload()
+    assert all(torch.equal(p.detach(), original) for p, original in original_weights)
+    reloaded = WikiGamePolicy(model=base, tokenizer=policy.tokenizer)
+    reloaded.model = PeftModel.from_pretrained(reloaded.model, checkpoint, is_trainable=True)
+    reloaded.model.eval()
+    assert any(p.requires_grad for p in reloaded.model.parameters())
+    with torch.no_grad():
+        rescored = reloaded.get_token_log_probs(
+            decision["prompt_ids"], decision["token_ids"], decision["token_choices"],
+        ).sum().item()
+    assert rescored == pytest.approx(report["log_prob_after"], abs=1e-5)
+    force_action(reloaded, observation, 10, monkeypatch)
+    assert_decision(reloaded, observation, reloaded.choose_action(observation))
+
+
+@pytest.mark.integration
+def test_pretrained_lora_update(real_policy, observation, monkeypatch, tmp_path):
+    """Exercise the actual actor on its selected device without changing saved weights."""
+    actor = real_policy
+    original_flags = [(p, p.requires_grad) for p in actor.model.parameters()]
+    force_action(actor, observation, 10, monkeypatch)
+    decision = actor.choose_action(observation)
+    try:
+        if actor.model.device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(actor.model.device)
+        report = check_lora_update(actor, observation, decision, atol=1e-4)
+        checkpoint = tmp_path / "adapter"
+        actor.model.save_pretrained(checkpoint, save_embedding_layers=False)
+        actor.model = PeftModel.from_pretrained(actor.model.unload(), checkpoint, is_trainable=True)
+        actor.model.eval()
+        with torch.no_grad():
+            reloaded = actor.get_token_log_probs(
+                decision["prompt_ids"], decision["token_ids"], decision["token_choices"],
+            ).sum().item()
+        assert reloaded == pytest.approx(report["log_prob_after"], abs=1e-4)
+        force_action(actor, observation, 10, monkeypatch)
+        assert_decision(actor, observation, actor.choose_action(observation), atol=1e-4)
+        report["adapter_reload_probability_check_passed"] = True
+        report["device"] = str(actor.model.device)
+        report["base_dtype"] = str(next(actor.model.get_base_model().parameters()).dtype)
+        if actor.model.device.type == "cuda":
+            report["peak_allocated_gib"] = torch.cuda.max_memory_allocated(actor.model.device) / 2**30
+        print("LoRA training check:", json.dumps(report, indent=2))
+    finally:
+        if isinstance(actor.model, PeftModel):
+            actor.model = actor.model.unload()
+        for parameter, flag in original_flags:
+            parameter.requires_grad_(flag)
+        actor.model.eval()

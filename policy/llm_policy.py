@@ -1,6 +1,7 @@
 import json
 
 import torch
+from peft import LoraConfig, PeftModel, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from policy.prompt import OBSERVATION_TEMPLATE, SYSTEM_PROMPT, TOOLS
@@ -29,6 +30,21 @@ class WikiGamePolicy:
         )
         if model is None:
             self.model.to(device)
+        self.model.eval()
+
+    def enable_lora(self, rank=8, alpha=16):
+        """Freeze the actor and attach trainable, initially neutral LoRA adapters.
+
+        Keep dropout disabled for rollout/training probability consistency.
+        Use PEFT's save_pretrained/from_pretrained methods for adapter checkpoints.
+        """
+        if isinstance(self.model, PeftModel):
+            raise ValueError("The policy already has adapters attached.")
+        self.model = get_peft_model(self.model, LoraConfig(
+            task_type="CAUSAL_LM", r=rank, lora_alpha=alpha,
+            target_modules="all-linear", lora_dropout=0.0, bias="none",
+            init_lora_weights=True,
+        ))
         self.model.eval()
 
     def build_prompt(self, observation):
