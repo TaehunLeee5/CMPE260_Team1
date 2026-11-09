@@ -7,6 +7,25 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def link_index(arguments, outgoing, articles):
+    """Return the environment link index named by follow_link arguments, or None.
+
+    Current traces name the link by title. Traces saved before the title format
+    used {"link_id": index}; those are still accepted so older results can be
+    replayed and audited.
+    """
+    if not isinstance(arguments, dict):
+        return None
+    if set(arguments) == {"title"}:
+        title = arguments["title"]
+        matches = [i for i, article in enumerate(outgoing) if articles[article]["title"] == title]
+        return matches[0] if isinstance(title, str) and len(matches) == 1 else None
+    if set(arguments) == {"link_id"}:
+        index = arguments["link_id"]
+        return index if type(index) is int and 0 <= index < len(outgoing) else None
+    return None
+
+
 def _analyze_episode(episode, articles, budget):
     start, target = episode["start"], episode["target"]
     path, clicks = episode["path"], episode["clicks"]
@@ -40,10 +59,9 @@ def _analyze_episode(episode, articles, budget):
         name, arguments = call["name"], call["arguments"]
         selected_id = None
         if name == "follow_link":
-            selected_id = arguments.get("link_id")
-            if (set(arguments) != {"link_id"} or type(selected_id) is not int
-                    or not 0 <= selected_id < len(outgoing)):
-                raise ValueError(f"{step_label}: invalid link_id.")
+            selected_id = link_index(arguments, outgoing, articles)
+            if selected_id is None:
+                raise ValueError(f"{step_label}: follow_link does not name a link on this page.")
             chosen = outgoing[selected_id]
             stack.append(chosen)
         elif name == "go_back":
@@ -170,7 +188,7 @@ def analyze_routes(report, articles):
     return {
         "summary": summary, "settings": settings, "episodes": results,
         "interpretation": {
-            "missed_direct_target": "Target was a visible link, but follow_link chose another ID or go_back was selected. This does not distinguish copying errors from navigation choices.",
+            "missed_direct_target": "Target was a visible link, but follow_link chose another link or go_back was selected.",
             "revisit": "A move to any previously visited article, including Back and self-links. Revisits can be useful.",
             "self_link": "A follow_link call whose destination is the current article; Back across a self-link is counted separately as go_back.",
             "immediate_backtrack": "A distinct-node A -> B -> A pattern, regardless of which tools were used. This differs from the count of go_back calls.",
@@ -200,10 +218,10 @@ def main():
     print(json.dumps(audit["summary"], indent=2))
     for episode in audit["episodes"]:
         for event in episode["missed_direct_target_steps"]:
-            selected = "go_back" if event["selected_tool"] == "go_back" else f"follow_link({event['selected_action_id']})"
+            selected = "go_back" if event["selected_tool"] == "go_back" else "follow_link"
             print(f"MISSED TARGET | {episode['start_title']} -> {episode['target_title']} | "
                   f"step {event['step']} at {event['current_title']}: "
-                  f"expected {event['expected_action_id']}: {event['target_title']}, "
+                  f"expected {event['target_title']}, "
                   f"selected {selected} -> {event['selected_title']}")
     print(f"\nSaved: {args.output}")
 

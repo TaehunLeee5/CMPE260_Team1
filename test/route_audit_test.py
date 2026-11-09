@@ -10,8 +10,8 @@ import pytest
 from evaluation.audit_saved_routes import analyze_routes
 
 
-def follow(link_id):
-    return {"name": "follow_link", "arguments": {"link_id": link_id}}
+def follow(title):
+    return {"name": "follow_link", "arguments": {"title": title}}
 
 
 def back():
@@ -49,7 +49,7 @@ def articles():
 def report():
     return make_report(
         ["A", "C", "A", "B", "T"],
-        [follow(2), back(), follow(1), follow(1)], ["A", "B", "T"],
+        [follow("Article C"), back(), follow("Article B"), follow("Target")], ["A", "B", "T"],
     )
 
 
@@ -75,7 +75,7 @@ def test_back_without_reverse_link_is_valid(report, articles, budget):
 
 
 def test_back_can_miss_a_visible_target(articles):
-    report = make_report(["A", "B", "A", "T"], [follow(1), back(), follow(3)], ["A", "T"])
+    report = make_report(["A", "B", "A", "T"], [follow("Article B"), back(), follow("Target")], ["A", "T"])
     audit = analyze_routes(report, articles)
     event = audit["episodes"][0]["missed_direct_target_steps"][1]
     assert event["current_id"] == "B"
@@ -89,7 +89,8 @@ def test_back_can_miss_a_visible_target(articles):
 def test_tool_trace_distinguishes_identical_routes(articles, use_back):
     report = make_report(
         ["A", "B", "A", "B", "T"],
-        [follow(1), follow(0), back() if use_back else follow(1), follow(1)],
+        [follow("Article B"), follow("Article A"), back() if use_back else follow("Article B"),
+         follow("Target")],
         ["A", "B", "T"] if use_back else ["A", "B", "A", "B", "T"],
     )
     summary = analyze_routes(report, articles)["summary"]
@@ -98,7 +99,7 @@ def test_tool_trace_distinguishes_identical_routes(articles, use_back):
 
 
 def test_back_across_self_link_is_not_a_second_self_link(articles):
-    report = make_report(["A", "A", "A", "T"], [follow(0), back(), follow(3)], ["A", "T"])
+    report = make_report(["A", "A", "A", "T"], [follow("Article A"), back(), follow("Target")], ["A", "T"])
     summary = analyze_routes(report, articles)["summary"]
     assert summary["self_link_moves"] == summary["go_back_calls"] == 1
     assert summary["total_revisits"] == 2
@@ -108,13 +109,13 @@ def test_back_across_self_link_is_not_a_second_self_link(articles):
 def test_repeated_back_replays_duplicate_stack_entries(articles):
     report = make_report(
         ["A", "B", "A", "B", "A", "T"],
-        [follow(1), follow(0), back(), back(), follow(3)], ["A", "T"],
+        [follow("Article B"), follow("Article A"), back(), back(), follow("Target")], ["A", "T"],
     )
     assert analyze_routes(report, articles)["summary"]["go_back_calls"] == 2
 
 
 def test_summary_aggregates_success_and_budget_failure(report, articles):
-    failure = make_report(["A"] * 7, [follow(0)] * 6, ["A"] * 7)["episodes"][0]
+    failure = make_report(["A"] * 7, [follow("Article A")] * 6, ["A"] * 7)["episodes"][0]
     report["episodes"].append(failure)
     summary = analyze_routes(report, articles)["summary"]
     assert summary["episodes"] == 2
@@ -139,19 +140,33 @@ def test_corrupted_episode_fields_rejected(report, articles, field, value):
         analyze_routes(report, articles)
 
 
-@pytest.mark.parametrize("link_id", [-1, True, 2.0, 999])
-def test_invalid_link_id_rejected(report, articles, link_id):
-    report["episodes"][0]["tool_calls"][0] = follow(link_id)
-    with pytest.raises(ValueError, match="invalid link_id"):
+@pytest.mark.parametrize("title", ["Nonexistent", "article c", "Article C ", "", None, 2])
+def test_title_not_on_page_rejected(report, articles, title):
+    report["episodes"][0]["tool_calls"][0] = follow(title)
+    with pytest.raises(ValueError, match="does not name a link"):
         analyze_routes(report, articles)
+
+
+def test_legacy_link_id_traces_still_audit(report, articles):
+    """Results saved before the title format used integer link IDs."""
+    legacy = deepcopy(report)
+    indices = iter([2, 1, 1])  # Article C and Article B from A, then Target from B.
+    for call in legacy["episodes"][0]["tool_calls"]:
+        if call["name"] == "follow_link":
+            call["arguments"] = {"link_id": next(indices)}
+    assert analyze_routes(legacy, articles)["summary"] == analyze_routes(report, articles)["summary"]
+    legacy["episodes"][0]["tool_calls"][0] = {"name": "follow_link", "arguments": {"link_id": 999}}
+    with pytest.raises(ValueError, match="does not name a link"):
+        analyze_routes(legacy, articles)
 
 
 @pytest.mark.parametrize("call", [
     {"name": "search", "arguments": {}},
     {"name": "follow_link", "arguments": {}},
-    {"name": "follow_link", "arguments": {"link_id": 2, "extra": 1}},
-    {"name": "follow_link", "arguments": [2]},
-    {"arguments": {"link_id": 2}},
+    {"name": "follow_link", "arguments": {"title": "Article C", "extra": 1}},
+    {"name": "follow_link", "arguments": {"title": "Article C", "link_id": 2}},
+    {"name": "follow_link", "arguments": ["Article C"]},
+    {"arguments": {"title": "Article C"}},
 ])
 def test_malformed_tool_call_rejected(report, articles, call):
     report["episodes"][0]["tool_calls"][0] = call
@@ -166,14 +181,14 @@ def test_back_at_start_rejected(report, articles):
 
 
 def test_back_arguments_rejected(report, articles):
-    report["episodes"][0]["tool_calls"][1]["arguments"] = {"link_id": 0}
+    report["episodes"][0]["tool_calls"][1]["arguments"] = {"title": "Article A"}
     with pytest.raises(ValueError, match="takes no arguments"):
         analyze_routes(report, articles)
 
 
 @pytest.mark.parametrize("step", [0, 2])
 def test_wrong_forward_destination_rejected(report, articles, step):
-    report["episodes"][0]["tool_calls"][step] = follow(3)
+    report["episodes"][0]["tool_calls"][step] = follow("Target")
     with pytest.raises(ValueError, match="destination disagrees"):
         analyze_routes(report, articles)
 
@@ -191,7 +206,7 @@ def test_missing_tool_trace_is_not_inferred_from_path(report, articles):
 
 
 def test_premature_failure_is_rejected(articles):
-    report = make_report(["A", "B"], [follow(1)], ["A", "B"])
+    report = make_report(["A", "B"], [follow("Article B")], ["A", "B"])
     with pytest.raises(ValueError, match="stopped before"):
         analyze_routes(report, articles)
 
@@ -201,7 +216,7 @@ def test_no_direct_target_opportunities(articles):
         "settings": {"max_clicks": 2},
         "episodes": [{
             "start": "B", "target": "C", "path": ["B", "A", "B"],
-            "tool_calls": [follow(0), back()], "navigation_stack": ["B"],
+            "tool_calls": [follow("Article A"), back()], "navigation_stack": ["B"],
             "clicks": 2, "success": False, "episode_return": 0,
             "reason": "click_budget", "terminated": True, "truncated": False,
             "shortest_distance": 2, "path_efficiency": None,
@@ -228,7 +243,9 @@ def test_evaluation_and_standalone_audit_agree(tmp_path, articles, report):
 
     def choose(observation, deterministic=False):
         call = next(calls)
-        action = observation["back_action_id"] if call["name"] == "go_back" else call["arguments"]["link_id"]
+        action = observation["back_action_id"] if call["name"] == "go_back" else next(
+            link["id"] for link in observation["actions"] if link["title"] == call["arguments"]["title"]
+        )
         return {"action": action, "tool_call": call, "log_prob": 0.0}
 
     env = WikiGameEnv(path, max_clicks=6)
@@ -252,7 +269,7 @@ def test_cli_and_input_overwrite_protection(tmp_path, report, articles):
     assert run.returncode == 0, run.stderr
     saved = json.loads(output.read_text(encoding="utf-8"))
     assert saved["summary"] == analyze_routes(report, articles)["summary"]
-    assert "follow_link(2)" in run.stdout
+    assert "expected Target, selected follow_link -> Article C" in run.stdout
     for destination in [inputs, graph]:
         before = destination.read_bytes()
         run = subprocess.run([*args, str(destination)], cwd=root, capture_output=True, text=True)

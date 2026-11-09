@@ -145,9 +145,9 @@ def probe_goals(policy, states, controls=2, *, templates=None):
         "states": results, "skipped": skipped,
         "interpretation": {
             "scope": "Synthetic one-step goal interventions, not new navigation episodes or benchmark success rates.",
-            "controls": "A control goal is an unvisited current link, reachable in one action. Correct selection requires its complete ID.",
+            "controls": "A control goal is an unvisited current link, reachable in one action. Correct selection requires its exact title.",
             "fixed_context": "Only target_title changes. All variants use identical links, history, budget, Back availability, and article text.",
-            "probabilities": "Scores are complete-call log probabilities for the selected control IDs, not a full normalized distribution over all actions.",
+            "probabilities": "Scores are complete-call log probabilities for the selected control links, keyed by internal action ID, not a full normalized distribution over all actions.",
             "unchanged_action": "An unchanged greedy action alone does not prove goal insensitivity. Inspect correctness and probability shifts; an original action may already match a control.",
             "limits": "Direct-target copying does not establish good intermediate navigation. These probes do not evaluate remote-goal strategy.",
         },

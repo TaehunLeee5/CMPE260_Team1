@@ -52,10 +52,10 @@ class WikiGamePolicy:
         self.model.eval()
 
     def build_prompt(self, observation):
-        """Format the visible state without exposing internal Back action IDs."""
+        """Format the visible state; internal environment action IDs are never shown."""
         values = observation.copy()
         values["links"] = "\n".join(
-            f"{action['id']}: {action['title']}" for action in observation["actions"]
+            f"- {action['title']}" for action in observation["actions"]
         ) or "None"
         values["history"] = " -> ".join(observation["history"])
         values["navigation_stack"] = " -> ".join(observation["navigation_stack"])
@@ -65,13 +65,20 @@ class WikiGamePolicy:
         return self.observation_template.format(**values)
 
     def _tool_calls(self, observation):
-        """Map each legal internal environment action to its native tool call."""
-        calls = {}
+        """Map each legal internal environment action to its native tool call.
+
+        The model names a link by its title; the environment action ID stays
+        internal and is recovered from the title, so titles must be unique.
+        """
+        calls, titles = {}, set()
         for action in observation["actions"]:
-            ident = action["id"]
+            ident, title = action["id"], action["title"]
             if type(ident) is not int or ident < 0 or ident in calls:
                 raise ValueError("Link IDs must be unique nonnegative integers.")
-            calls[ident] = {"name": "follow_link", "arguments": {"link_id": ident}}
+            if not isinstance(title, str) or not title.strip() or title in titles:
+                raise ValueError(f"Link titles must be unique nonempty strings: {title!r}")
+            titles.add(title)
+            calls[ident] = {"name": "follow_link", "arguments": {"title": title}}
         if observation["back_available"]:
             ident = observation["back_action_id"]
             if type(ident) is not int or ident < 0 or ident in calls:
@@ -82,10 +89,13 @@ class WikiGamePolicy:
         return calls
 
     def _action_sequences(self, calls):
-        """Use one canonical Hermes-style encoding per action, ending at EOS."""
+        """Use one canonical Hermes-style encoding per action, ending at EOS.
+
+        Titles stay as UTF-8 text (e.g. "Côte d'Ivoire"), not \\u escapes.
+        """
         return {
             action: self.tokenizer.encode(
-                "<tool_call>\n" + json.dumps(call) + "\n</tool_call>",
+                "<tool_call>\n" + json.dumps(call, ensure_ascii=False) + "\n</tool_call>",
                 add_special_tokens=False,
             ) + [self.tokenizer.eos_token_id]
             for action, call in calls.items()

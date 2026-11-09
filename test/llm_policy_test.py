@@ -91,10 +91,12 @@ def test_prompt_and_tool_definitions(policy, observation):
     original = deepcopy(observation)
     inputs = policy._prepare_inputs(observation, 80)
     prompt = policy.tokenizer.decode(inputs["input_ids"][0])
-    for text in ["follow_link", "go_back", "link_id", "Target article: France",
-                 "Back: Earth", "Navigation stack: Earth -> Europe", "<think>\n\n</think>"]:
+    for text in ["follow_link", "go_back", '"required": ["title"]', "Target article: France",
+                 "Back: Earth", "Navigation stack: Earth -> Europe", "<think>\n\n</think>",
+                 "Available links:\n- Germany\n- Italy\n- Spain\n- France\n"]:
         assert text in prompt
-    assert "back_action_id" not in prompt
+    assert "back_action_id" not in prompt and "link_id" not in prompt
+    assert "100: France" not in prompt  # Internal environment action IDs stay hidden.
     assert observation == original
     observation.update(back_available=False, back_action_id=None, back_destination=None)
     prompt = policy.tokenizer.decode(policy._prepare_inputs(observation, 80)["input_ids"][0])
@@ -103,10 +105,21 @@ def test_prompt_and_tool_definitions(policy, observation):
     assert set(policy._tool_calls(observation)) == {0, 2, 10, 100}
 
 
-@pytest.mark.parametrize("count", [1, 2, 9, 10, 11, 99, 100, 101, 294])
-def test_all_calls_are_reachable(policy, observation, count):
-    observation["actions"] = [{"id": i, "title": str(i)} for i in range(count)]
+SHARED_PREFIX_TITLES = [
+    "United", "United States", "United Kingdom", "United Nations", "Union",
+    'Quote "Marks"', "Back\\slash", "Rock (music)", "Rock and roll", "Ro",
+]
+
+
+@pytest.mark.parametrize("titles", [
+    *[[str(i) for i in range(count)] for count in [1, 2, 9, 10, 11, 99, 100, 101, 294]],
+    SHARED_PREFIX_TITLES,
+])
+def test_all_calls_are_reachable(policy, observation, titles):
+    count = len(titles)
+    observation["actions"] = [{"id": i, "title": title} for i, title in enumerate(titles)]
     calls = policy._tool_calls(observation)
+    assert {call["arguments"]["title"] for call in calls.values() if call["arguments"]} == set(titles)
     sequences = policy._action_sequences(calls)
     assert len({tuple(s) for s in sequences.values()}) == count + 1
     for action, tokens in sequences.items():
@@ -115,6 +128,20 @@ def test_all_calls_are_reachable(policy, observation, count):
         assert not policy._allowed_tokens(sequences, tokens)
         text = policy.tokenizer.decode(tokens[:-1])
         assert json.loads(text[len("<tool_call>\n"):-len("\n</tool_call>")]) == calls[action]
+
+
+def test_tool_calls_use_titles_and_keep_unicode(policy, observation, monkeypatch):
+    calls = policy._tool_calls(observation)
+    assert calls[100] == {"name": "follow_link", "arguments": {"title": "France"}}
+    assert calls[300] == {"name": "go_back", "arguments": {}}
+    observation["actions"] = [{"id": 4, "title": "Côte d'Ivoire"}, {"id": 9, "title": "Zürich"}]
+    encoded = []
+    encode = policy.tokenizer.encode
+    monkeypatch.setattr(policy.tokenizer, "encode", lambda text, **kwargs: encoded.append(text) or encode(text, **kwargs))
+    policy._action_sequences(policy._tool_calls(observation))
+    assert '<tool_call>\n{"name": "follow_link", "arguments": {"title": "Côte d\'Ivoire"}}\n</tool_call>' in encoded
+    assert any("Zürich" in text for text in encoded)
+    assert not any("\\u" in text for text in encoded)
 
 
 @pytest.mark.parametrize("deterministic", [False, True])
@@ -198,7 +225,7 @@ def test_text_truncation_preserves_state_and_links(policy, observation, monkeypa
     prompt = policy.tokenizer.decode(inputs["input_ids"][0])
     assert inputs["input_ids"].shape[1] <= limit
     for action in observation["actions"]:
-        assert f"{action['id']}: {action['title']}" in prompt
+        assert f"- {action['title']}" in prompt
     assert "Back: Earth" in prompt and "Visited route: Earth -> Europe" in prompt
     assert observation == original
     monkeypatch.setattr(policy, "max_input_tokens", 1)
@@ -213,6 +240,12 @@ def test_invalid_actions_and_records_rejected(policy, observation):
         policy.get_token_log_probs([1], [1], [[2]])
     observation["actions"].append(observation["actions"][0])
     with pytest.raises(ValueError, match="unique"):
+        policy.choose_action(observation)
+    observation["actions"][-1] = {"id": 7, "title": "Germany"}  # Same title, new ID.
+    with pytest.raises(ValueError, match="titles must be unique"):
+        policy.choose_action(observation)
+    observation["actions"][-1] = {"id": 7, "title": "  "}
+    with pytest.raises(ValueError, match="titles must be unique nonempty"):
         policy.choose_action(observation)
     observation["actions"] = []
     observation["back_available"] = False
@@ -402,7 +435,7 @@ def test_goal_probe_reports_probability_changes_without_argmax_change(policy, ob
 
     def choose(variant, deterministic=False):
         return {
-            "action": 0, "tool_call": {"name": "follow_link", "arguments": {"link_id": 0}},
+            "action": 0, "tool_call": {"name": "follow_link", "arguments": {"title": "Germany"}},
             "log_prob": math.log(probability(variant, 0)), "prompt_ids": [1],
         }
 
@@ -437,7 +470,7 @@ def test_article_first_layout_changes_order_only(policy, observation, monkeypatc
     candidate = policy.build_prompt(observation)
     assert current.index("Target article:") < current.index("Current article text:")
     assert candidate.index("Current article text:") < candidate.index("Target article:") < candidate.index("Available links:")
-    for value in [observation["text"], observation["target_title"], "0: Germany", "100: France", "Earth -> Europe"]:
+    for value in [observation["text"], observation["target_title"], "- Germany", "- France", "Earth -> Europe"]:
         assert value in current and value in candidate
     assert_decision(policy, observation, policy.choose_action(observation, deterministic=True))
 

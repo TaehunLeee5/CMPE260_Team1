@@ -217,6 +217,7 @@ def main():
             "sample_seed": args.seed if args.limit is not None else None,
             "max_input_tokens": policy.max_input_tokens,
             "action_format": "qwen_tool_call",
+            "follow_link_argument": "title",
             "enable_thinking": False,
             "use_cache": False,
             "decoder": "forced_token_skip",

@@ -406,7 +406,7 @@ def main():
                 training_metrics_phase="before_optimizer_step", validation_metrics_phase="after_optimizer_step",
                 system_prompt=policy.system_prompt, observation_template=policy.observation_template,
                 lora={"rank": 8, "alpha": 16, "dropout": 0.0, "target_modules": "all-linear"},
-                temperature=1.0, use_cache=False,
+                temperature=1.0, use_cache=False, follow_link_argument="title",
             )
             output.mkdir(parents=True)
         summary = run_training(EpisodeRunner(env, policy), optimizer, tasks, val_tasks, output, batches, config, progress)
