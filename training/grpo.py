@@ -105,12 +105,13 @@ def _branch_count(episode):
     return count
 
 
-def _branch_scores(policy, episode):
-    for step in episode["steps"]:
-        scores = policy.iter_token_log_probs(step["prompt_ids"], step["token_ids"], step["token_choices"])
-        for current, old, choices in zip(scores, step["token_log_probs"], step["token_choices"]):
-            if len(choices) > 1:
-                yield current, old
+def _step_branch_scores(policy, step):
+    """Score one recorded step in a single forward pass; return (current, old) per branch token."""
+    positions = [i for i, choices in enumerate(step["token_choices"]) if len(choices) > 1]
+    if not positions:
+        return []
+    scores = policy.get_token_log_probs(step["prompt_ids"], step["token_ids"], step["token_choices"])
+    return [(scores[i], step["token_log_probs"][i]) for i in positions]
 
 
 def grpo_update(policy, groups, optimizer, clip_range=0.2, max_grad_norm=1.0, atol=1e-4,
@@ -152,6 +153,8 @@ def grpo_update(policy, groups, optimizer, clip_range=0.2, max_grad_norm=1.0, at
         "gradient_norm_before_clipping": None, "adapters_changed": False,
         "initial_probability_checks_passed": None,
         "post_update_token_ratio": None,
+        "max_sampling_rescore_error": max(
+            (step.get("sampling_max_abs_error", 0.0) for e, _, _ in rows for step in e["steps"]), default=0.0),
         "timings": {"gradient_seconds": 0.0, "post_check_seconds": 0.0},
     }
     optimizer.zero_grad(set_to_none=True)
@@ -165,19 +168,26 @@ def grpo_update(policy, groups, optimizer, clip_range=0.2, max_grad_norm=1.0, at
         policy.model.train()
         with tqdm(total=total_tokens, desc="Accumulating gradients", unit="token") as progress:
             for episode, advantage, count in active:
-                for current, old in _branch_scores(policy, episode):
-                    error = abs(current.detach().item() - old)
-                    if not math.isfinite(error) or error > atol:
-                        raise RuntimeError("Behavior log probabilities do not match: collect fresh rollouts with unchanged weights and masks.")
-                    result["max_initial_token_log_prob_error"] = max(result["max_initial_token_log_prob_error"], error)
-                    ratio_error = abs(math.expm1(current.detach().item() - old))
-                    result["max_initial_ratio_error"] = max(result["max_initial_ratio_error"], ratio_error)
-                    loss = clipped_token_loss(current, current.new_tensor(old), advantage, clip_range) / (count * len(rows))
+                for step in episode["steps"]:
+                    branches = _step_branch_scores(policy, step)
+                    if not branches:
+                        continue
+                    loss = 0
+                    for current, old in branches:
+                        error = abs(current.detach().item() - old)
+                        if not math.isfinite(error) or error > atol:
+                            raise RuntimeError("Behavior log probabilities do not match: collect fresh rollouts with unchanged weights and masks.")
+                        result["max_initial_token_log_prob_error"] = max(result["max_initial_token_log_prob_error"], error)
+                        ratio_error = abs(math.expm1(current.detach().item() - old))
+                        result["max_initial_ratio_error"] = max(result["max_initial_ratio_error"], ratio_error)
+                        loss = loss + clipped_token_loss(current, current.new_tensor(old), advantage, clip_range)
+                    # One backward pass per step; each token keeps weight 1 / (count * routes).
+                    loss = loss / (count * len(rows))
                     if not torch.isfinite(loss):
                         raise RuntimeError("Nonfinite GRPO loss; optimizer was not stepped.")
                     loss.backward()
                     result["loss"] += loss.detach().item()
-                    progress.update(1)
+                    progress.update(len(branches))
         result["initial_probability_checks_passed"] = True
         if any(p.grad is not None for p, _ in frozen):
             raise RuntimeError("A frozen base parameter received a gradient.")
@@ -201,12 +211,13 @@ def grpo_update(policy, groups, optimizer, clip_range=0.2, max_grad_norm=1.0, at
         ratios = []
         with torch.no_grad(), tqdm(total=total_tokens, desc="Checking updated policy", unit="token") as progress:
             for episode, _, _ in active:
-                for current, old in _branch_scores(policy, episode):
-                    ratio = math.exp(current.item() - old)
-                    if not math.isfinite(ratio):
-                        raise RuntimeError("A post-update probability ratio is nonfinite.")
-                    ratios.append(ratio)
-                    progress.update(1)
+                for step in episode["steps"]:
+                    for current, old in _step_branch_scores(policy, step):
+                        ratio = math.exp(current.item() - old)
+                        if not math.isfinite(ratio):
+                            raise RuntimeError("A post-update probability ratio is nonfinite.")
+                        ratios.append(ratio)
+                        progress.update(1)
         result["post_update_token_ratio"] = {
             "mean": mean(ratios), "min": min(ratios), "max": max(ratios),
             "fraction_outside_clip_range": mean(not 1 - clip_range <= r <= 1 + clip_range for r in ratios),
@@ -450,6 +461,8 @@ def main():
                 algorithm="constrained_token_grpo", kl_beta=0.0, advantage_std_correction=0,
                 advantage_epsilon=None, advantage_divisor="max(population_std, min_advantage_std)",
                 distance_sampling="uniform_over_distances_then_uniform_task",
+                rollout_decoder="kv_cached_sampling_then_teacher_forced_rescore",
+                training_scorer="one_teacher_forced_pass_per_step",
                 loss_normalization="mean_branch_tokens_per_route_then_mean_all_routes",
                 optimizer_steps_per_batch=1, gradient_checkpointing="non_reentrant",
                 post_update_checks="validation_batches", data_sha256=hashes, runtime=runtime,

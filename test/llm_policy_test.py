@@ -63,7 +63,7 @@ def observation():
     }
 
 
-def assert_decision(policy, observation, decision, atol=1e-5):
+def assert_decision(policy, observation, decision, atol=1e-5, reference=False):
     calls = policy._tool_calls(observation)
     assert decision["tool_call"] == calls[decision["action"]]
     assert json.loads(json.dumps(decision)) == decision
@@ -73,9 +73,14 @@ def assert_decision(policy, observation, decision, atol=1e-5):
     assert raw.startswith("<tool_call>\n") and raw.endswith("\n</tool_call>")
     assert json.loads(raw[len("<tool_call>\n"):-len("\n</tool_call>")]) == decision["tool_call"]
     with torch.enable_grad():
-        rescored = policy.get_token_log_probs(
-            decision["prompt_ids"], tokens, decision["token_choices"],
-        )
+        if reference:
+            rescored = torch.stack(list(policy.iter_token_log_probs(
+                decision["prompt_ids"], tokens, decision["token_choices"],
+            )))
+        else:
+            rescored = policy.get_token_log_probs(
+                decision["prompt_ids"], tokens, decision["token_choices"],
+            )
     expected = torch.tensor(decision["token_log_probs"], device=rescored.device)
     assert rescored.requires_grad
     assert torch.allclose(rescored.detach(), expected, atol=atol, rtol=0)
@@ -310,8 +315,13 @@ def real_policy():
 @pytest.mark.parametrize("deterministic", [False, True])
 def test_pretrained_rollout_and_training_match(real_policy, observation, deterministic):
     decision = real_policy.choose_action(observation, deterministic)
-    assert_decision(real_policy, observation, decision, atol=1e-4)
+    # Greedy decisions use per-prefix passes; sampled decisions record the training scorer.
+    assert_decision(real_policy, observation, decision, atol=1e-4, reference=deterministic)
     print("Tool:", decision["tool_call"], "log probability:", decision["log_prob"])
+    if not deterministic:
+        # Cached draw probabilities versus the recorded teacher-forced ones (bf16 rounding).
+        print("Sampling vs recorded max abs error:", decision["sampling_max_abs_error"])
+        assert decision["sampling_max_abs_error"] < 0.1
 
 
 @pytest.mark.integration
@@ -359,6 +369,78 @@ def test_forward_passes_only_at_branching_prefixes(policy, observation):
     decisions = sum(len(choices) > 1 for choices in decision["token_choices"])
     assert len(forwards) == decisions
     assert decisions < len(decision["token_ids"])
+
+
+def count_forwards(model):
+    calls = []
+    return calls, model.register_forward_pre_hook(lambda module, inputs: calls.append(1))
+
+
+def test_sampled_decision_uses_cache_then_one_rescore(policy, observation):
+    calls, hook = count_forwards(policy.model)
+    try:
+        decision = policy.choose_action(observation, deterministic=False)
+    finally:
+        hook.remove()
+    decisions = sum(len(choices) > 1 for choices in decision["token_choices"])
+    assert decisions > 0
+    assert len(calls) == decisions + 1  # One cached pass per branch, plus the recording pass.
+    assert decision["sampling_max_abs_error"] < 1e-5
+    assert_decision(policy, observation, decision)
+
+
+def test_sampled_records_exactly_what_training_scores(policy, observation):
+    decision = policy.choose_action(observation, deterministic=False)
+    with torch.enable_grad():
+        current = policy.get_token_log_probs(
+            decision["prompt_ids"], decision["token_ids"], decision["token_choices"])
+    assert current.detach().tolist() == pytest.approx(decision["token_log_probs"], abs=1e-6)
+
+
+def test_cached_draws_match_reference_prefix_probabilities(policy, observation, monkeypatch):
+    """The cached distribution at each branch equals the uncached per-prefix one."""
+    seen = []
+    real_multinomial = torch.multinomial
+
+    def record(probabilities, num_samples=1, **kwargs):
+        seen.append(probabilities.clone())
+        return real_multinomial(probabilities, num_samples, **kwargs)
+
+    monkeypatch.setattr(torch, "multinomial", record)
+    decision = policy.choose_action(observation, deterministic=False)
+    branches = [i for i, choices in enumerate(decision["token_choices"]) if len(choices) > 1]
+    assert len(seen) == len(branches)
+    with torch.no_grad():
+        for probabilities, i in zip(seen, branches):
+            reference = policy._next_log_probs(
+                decision["prompt_ids"], decision["token_ids"][:i], decision["token_choices"][i]).exp()
+            assert torch.allclose(probabilities, reference, atol=1e-6)
+
+
+def test_training_scores_a_step_in_one_forward_pass(policy, observation):
+    decision = policy.choose_action(observation, deterministic=True)
+    assert sum(len(choices) > 1 for choices in decision["token_choices"]) > 1
+    calls, hook = count_forwards(policy.model)
+    try:
+        with torch.enable_grad():
+            scores = policy.get_token_log_probs(
+                decision["prompt_ids"], decision["token_ids"], decision["token_choices"])
+    finally:
+        hook.remove()
+    assert len(calls) == 1 and scores.requires_grad
+    reference = torch.stack(list(policy.iter_token_log_probs(
+        decision["prompt_ids"], decision["token_ids"], decision["token_choices"])))
+    assert torch.allclose(scores.detach(), reference.detach(), atol=1e-5)
+
+
+def test_cached_sampling_with_lora_and_checkpointing(policy, observation):
+    actor = WikiGamePolicy(model=deepcopy(policy.model), tokenizer=policy.tokenizer)
+    actor.enable_lora()
+    actor.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    for action in [0, 100, 300]:
+        decision = actor.choose_action(observation, deterministic=False)
+        assert_decision(actor, observation, decision)
+    assert not actor.model.training
 
 
 def test_standard_uncached_reference_agrees(policy, observation):
@@ -739,6 +821,28 @@ def test_streamed_grpo_matches_full_graph_update(policy, observation, monkeypatc
     assert json.loads(json.dumps(result, allow_nan=False)) == result
 
 
+@pytest.mark.parametrize("check_post_update", [False, True])
+def test_grpo_update_uses_one_forward_pass_per_step(policy, observation, monkeypatch, check_post_update):
+    actor = WikiGamePolicy(model=deepcopy(policy.model), tokenizer=policy.tokenizer)
+    actor.enable_lora()
+    actor.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    group = controlled_grpo_group(actor, observation, monkeypatch)
+    group[0]["steps"].append(deepcopy(group[0]["steps"][0]))  # A two-step route.
+    steps = sum(any(len(c) > 1 for c in step["token_choices"]) for e in group for step in e["steps"])
+    tokens = sum(len(c) > 1 for e in group for step in e["steps"] for c in step["token_choices"])
+    assert tokens > steps  # Several decision tokens per step, so per-token scoring would differ.
+    optimizer = torch.optim.AdamW((p for p in actor.model.parameters() if p.requires_grad), lr=1e-3)
+    calls, hook = count_forwards(actor.model)
+    try:
+        result = grpo_update(actor, [group], optimizer, max_grad_norm=1e9, atol=1e-5,
+                             check_post_update=check_post_update)
+    finally:
+        hook.remove()
+    assert result["optimizer_step_applied"] and result["active_branch_tokens"] == tokens
+    assert len(calls) == steps * (2 if check_post_update else 1)
+    assert result["max_sampling_rescore_error"] < 1e-5
+
+
 def test_grpo_skips_constant_reward_groups(policy, observation, monkeypatch):
     actor = WikiGamePolicy(model=deepcopy(policy.model), tokenizer=policy.tokenizer)
     actor.enable_lora()
@@ -751,6 +855,7 @@ def test_grpo_skips_constant_reward_groups(policy, observation, monkeypatch):
         raise AssertionError("Constant returns should not trigger scoring or an optimizer step.")
 
     monkeypatch.setattr(actor, "_next_log_probs", unexpected)
+    monkeypatch.setattr(actor, "_step_log_probs", unexpected)
     monkeypatch.setattr(optimizer, "step", unexpected)
     result = grpo_update(actor, [group], optimizer)
     assert not result["optimizer_step_applied"]

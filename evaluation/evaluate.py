@@ -220,7 +220,7 @@ def main():
             "follow_link_argument": "title",
             "enable_thinking": False,
             "use_cache": False,
-            "decoder": "forced_token_skip",
+            "decoder": "forced_token_skip" if not args.sample else "kv_cached_sampling_then_teacher_forced_rescore",
             "system_prompt": policy.system_prompt,
             "observation_template": policy.observation_template,
         })

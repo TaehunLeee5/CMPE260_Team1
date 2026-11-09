@@ -173,19 +173,75 @@ class WikiGamePolicy:
         ).logits[0, -1].float()
         return torch.log_softmax(logits[choices], dim=-1)
 
+    def _sample_cached(self, prompt_ids, sequences):
+        """Sample one legal call, reusing a KV cache between branching points.
+
+        The prompt is encoded once; each later forward pass only covers the tokens
+        appended since the previous branch. Forced tokens need no forward pass of
+        their own. Returns the tokens, their legal-token masks, and the log
+        probabilities the draws were made from.
+        """
+        tokens, token_choices, sampled = [], [], []
+        cache, pending = None, list(prompt_ids)
+        for _ in range(max(map(len, sequences.values()))):
+            choices = self._allowed_tokens(sequences, tokens)
+            if not choices:
+                raise RuntimeError("Generation reached an invalid tool-call prefix.")
+            if len(choices) == 1:
+                token, score = choices[0], 0.0
+            else:
+                output = self.model(
+                    input_ids=torch.tensor([pending], device=self.model.device, dtype=torch.long),
+                    past_key_values=cache, use_cache=True, logits_to_keep=1,
+                )
+                cache, pending = output.past_key_values, []
+                log_probs = torch.log_softmax(output.logits[0, -1].float()[choices], dim=-1)
+                index = torch.multinomial(log_probs.exp(), num_samples=1).item()
+                token, score = choices[index], log_probs[index].item()
+            tokens.append(token)
+            token_choices.append(choices)
+            sampled.append(score)
+            pending.append(token)
+            if token == self.tokenizer.eos_token_id:
+                break
+        return tokens, token_choices, sampled
+
     @torch.no_grad()
     def choose_action(self, observation, deterministic=False):
-        """Query the model only at branching prefixes of the legal-call grammar.
+        """Choose one legal call; forced syntax never needs a forward pass.
 
-        Forced syntax has probability one and is appended without a forward pass.
-        Actual choices use the same uncached calculation as training, with
-        temperature 1 and no top-k/top-p filtering.
+        Greedy decisions (evaluation) query the model uncached at each branching
+        prefix, exactly as the baselines were produced.
+
+        Sampled decisions (training rollouts) draw with a KV cache, then record
+        token log probabilities from one teacher-forced pass over the chosen call:
+        the same calculation training uses, so the recorded behavior
+        probabilities are reproduced exactly at update time. The draw itself
+        used the cached probabilities, which agree up to floating-point rounding;
+        sampling_max_abs_error reports the largest difference. Temperature is 1
+        with no top-k/top-p filtering.
         """
         self.model.eval()
         calls = self._tool_calls(observation)
         sequences = self._action_sequences(calls)
         inputs = self._prepare_inputs(observation, max(map(len, sequences.values())))
         prompt_ids = inputs["input_ids"][0].tolist()
+        if not deterministic:
+            tokens, token_choices, sampled = self._sample_cached(prompt_ids, sequences)
+            action = next((a for a, sequence in sequences.items() if sequence == tokens), None)
+            if action is None:
+                raise RuntimeError("Generation did not produce a complete legal tool call.")
+            if any(len(choices) > 1 for choices in token_choices):
+                scores = self._step_log_probs(prompt_ids, tokens, token_choices).tolist()
+            else:
+                scores = [0.0] * len(tokens)
+            return {
+                "action": action, "tool_call": calls[action], "prompt_ids": prompt_ids,
+                "token_ids": tokens, "token_choices": token_choices,
+                "token_log_probs": scores,
+                "log_prob": torch.tensor(scores, device=self.model.device, dtype=torch.float32).sum().item(),
+                "sampling_max_abs_error": max(abs(a - b) for a, b in zip(sampled, scores)),
+            }
         tokens, token_choices, scores = [], [], []
         for _ in range(max(map(len, sequences.values()))):
             choices = self._allowed_tokens(sequences, tokens)
@@ -214,16 +270,50 @@ class WikiGamePolicy:
             "log_prob": torch.tensor(scores, device=self.model.device, dtype=torch.float32).sum().item(),
         }
 
+    def _step_log_probs(self, prompt_ids, token_ids, token_choices):
+        """Score a whole recorded call with one teacher-forced forward pass.
+
+        The model reads the prompt plus every recorded token except the last; the
+        logits at the final len(token_ids) positions predict each recorded token.
+        Forced tokens contribute zero.
+        """
+        if not prompt_ids or not token_ids or len(token_ids) != len(token_choices):
+            raise ValueError("Provide a prompt and matching token/mask sequences.")
+        for token, choices in zip(token_ids, token_choices):
+            if not choices or len(choices) != len(set(choices)) or token not in choices:
+                raise ValueError("Each recorded token must have a valid legal-token mask.")
+        zero = torch.zeros((), device=self.model.device, requires_grad=torch.is_grad_enabled())
+        branches = [i for i, choices in enumerate(token_choices) if len(choices) > 1]
+        if not branches:
+            return torch.stack([zero] * len(token_ids))
+        input_ids = torch.tensor(
+            [prompt_ids + token_ids[:-1]], device=self.model.device, dtype=torch.long,
+        )
+        logits = self.model(
+            input_ids=input_ids, attention_mask=torch.ones_like(input_ids),
+            use_cache=False, logits_to_keep=len(token_ids),
+        ).logits[0]
+        scores = [zero] * len(token_ids)
+        for i in branches:
+            choices = token_choices[i]
+            log_probs = torch.log_softmax(logits[i].float()[choices], dim=-1)
+            scores[i] = log_probs[choices.index(token_ids[i])]
+        return torch.stack(scores)
+
     def get_token_log_probs(self, prompt_ids, token_ids, token_choices):
         """Score recorded tokens with gradients, using their exact input and masks.
 
-        Forced tokens contribute zero. Training controls model mode; keep dropout
-        disabled when comparing rollout and training probabilities.
+        One teacher-forced forward pass per call; this is the calculation training
+        uses. Forced tokens contribute zero. Training controls model mode; keep
+        dropout disabled when comparing rollout and training probabilities.
         """
-        return torch.stack(list(self.iter_token_log_probs(prompt_ids, token_ids, token_choices)))
+        return self._step_log_probs(prompt_ids, token_ids, token_choices)
 
     def iter_token_log_probs(self, prompt_ids, token_ids, token_choices):
-        """Yield scores separately so training can backpropagate one branch at a time."""
+        """Reference scorer: one uncached forward pass per branching prefix.
+
+        This is the calculation greedy decisions use; it is kept to check them.
+        """
         if not prompt_ids or not token_ids or len(token_ids) != len(token_choices):
             raise ValueError("Provide a prompt and matching token/mask sequences.")
         zero = torch.zeros((), device=self.model.device, requires_grad=torch.is_grad_enabled())
