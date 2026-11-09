@@ -1,5 +1,3 @@
-"""Saved-route validation, including Back moves without reverse hyperlinks."""
-
 from copy import deepcopy
 import json
 from pathlib import Path

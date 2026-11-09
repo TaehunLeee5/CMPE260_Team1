@@ -1,6 +1,7 @@
 import json
 
 import torch
+from peft import LoraConfig, PeftModel, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from policy.prompt import OBSERVATION_TEMPLATE, SYSTEM_PROMPT, TOOLS
@@ -10,8 +11,8 @@ class WikiGamePolicy:
     """Generate one legal Qwen tool call and retain its token probabilities."""
 
     def __init__(self, model_name="Qwen/Qwen3-1.7B", max_input_tokens=4096,
-                 *, model=None, tokenizer=None):
-        """Load the actor, or accept an existing model/tokenizer for tests and adapters."""
+                 *, model=None, tokenizer=None, adapter_path=None):
+        """Load the actor or injected model, optionally adding a frozen local adapter."""
         if max_input_tokens is not None and max_input_tokens < 1:
             raise ValueError("The input token budget must be positive.")
         self.system_prompt = SYSTEM_PROMPT
@@ -29,6 +30,25 @@ class WikiGamePolicy:
         )
         if model is None:
             self.model.to(device)
+        if adapter_path is not None:
+            self.model = PeftModel.from_pretrained(
+                self.model, adapter_path, is_trainable=False, local_files_only=True,
+            )
+        self.model.eval()
+
+    def enable_lora(self, rank=8, alpha=16):
+        """Freeze the actor and attach trainable, initially neutral LoRA adapters.
+
+        Keep dropout disabled for rollout/training probability consistency.
+        Use PEFT's save_pretrained/from_pretrained methods for adapter checkpoints.
+        """
+        if isinstance(self.model, PeftModel):
+            raise ValueError("The policy already has adapters attached.")
+        self.model = get_peft_model(self.model, LoraConfig(
+            task_type="CAUSAL_LM", r=rank, lora_alpha=alpha,
+            target_modules="all-linear", lora_dropout=0.0, bias="none",
+            init_lora_weights=True,
+        ))
         self.model.eval()
 
     def build_prompt(self, observation):
@@ -169,19 +189,21 @@ class WikiGamePolicy:
         Forced tokens contribute zero. Training controls model mode; keep dropout
         disabled when comparing rollout and training probabilities.
         """
+        return torch.stack(list(self.iter_token_log_probs(prompt_ids, token_ids, token_choices)))
+
+    def iter_token_log_probs(self, prompt_ids, token_ids, token_choices):
+        """Yield scores separately so training can backpropagate one branch at a time."""
         if not prompt_ids or not token_ids or len(token_ids) != len(token_choices):
             raise ValueError("Provide a prompt and matching token/mask sequences.")
-        scores = []
         zero = torch.zeros((), device=self.model.device, requires_grad=torch.is_grad_enabled())
         for position, (token, choices) in enumerate(zip(token_ids, token_choices)):
             if not choices or len(choices) != len(set(choices)) or token not in choices:
                 raise ValueError("Each recorded token must have a valid legal-token mask.")
             if len(choices) == 1:
-                scores.append(zero)
+                yield zero
                 continue
             log_probs = self._next_log_probs(prompt_ids, token_ids[:position], choices)
-            scores.append(log_probs[choices.index(token)])
-        return torch.stack(scores)
+            yield log_probs[choices.index(token)]
 
     def get_action_log_prob(self, observation, action):
         """Sum the masked token log probabilities of one complete legal call."""
