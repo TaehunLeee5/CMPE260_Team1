@@ -1,4 +1,5 @@
 import json
+import unicodedata
 
 import torch
 from peft import LoraConfig, PeftModel, get_peft_model
@@ -51,12 +52,32 @@ class WikiGamePolicy:
         ))
         self.model.eval()
 
+    @staticmethod
+    def _title_sort_key(title):
+        """Alphabetical by display title, ignoring case and accents (Åland sorts as Aland)."""
+        plain = "".join(
+            char for char in unicodedata.normalize("NFKD", title) if not unicodedata.combining(char)
+        )
+        return plain.casefold(), title
+
     def build_prompt(self, observation):
-        """Format the visible state; internal environment action IDs are never shown."""
+        """Format the visible state; internal environment action IDs are never shown.
+
+        Links are listed alphabetically by title. Links to the current page or to
+        articles already on the visited route are tagged; the tags are display
+        only, since constrained decoding lets the model generate just the title.
+        """
         values = observation.copy()
-        values["links"] = "\n".join(
-            f"- {action['title']}" for action in observation["actions"]
-        ) or "None"
+        visited = set(observation["history"])
+        lines = []
+        for action in sorted(observation["actions"], key=lambda a: self._title_sort_key(a["title"])):
+            title = action["title"]
+            if title == observation["current_title"]:
+                title += " (current page)"
+            elif title in visited:
+                title += " (visited)"
+            lines.append(f"- {title}")
+        values["links"] = "\n".join(lines) or "None"
         values["history"] = " -> ".join(observation["history"])
         values["navigation_stack"] = " -> ".join(observation["navigation_stack"])
         values["back_destination"] = (

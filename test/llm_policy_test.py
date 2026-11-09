@@ -93,7 +93,7 @@ def test_prompt_and_tool_definitions(policy, observation):
     prompt = policy.tokenizer.decode(inputs["input_ids"][0])
     for text in ["follow_link", "go_back", '"required": ["title"]', "Target article: France",
                  "Back: Earth", "Navigation stack: Earth -> Europe", "<think>\n\n</think>",
-                 "Available links:\n- Germany\n- Italy\n- Spain\n- France\n"]:
+                 "Available links:\n- France\n- Germany\n- Italy\n- Spain\n"]:
         assert text in prompt
     assert "back_action_id" not in prompt and "link_id" not in prompt
     assert "100: France" not in prompt  # Internal environment action IDs stay hidden.
@@ -128,6 +128,32 @@ def test_all_calls_are_reachable(policy, observation, titles):
         assert not policy._allowed_tokens(sequences, tokens)
         text = policy.tokenizer.decode(tokens[:-1])
         assert json.loads(text[len("<tool_call>\n"):-len("\n</tool_call>")]) == calls[action]
+
+
+def test_links_sorted_by_title_and_visited_links_tagged(policy, observation):
+    observation["history"] = ["Earth", "Spain", "Earth", "Europe"]
+    observation["actions"] = [{"id": i, "title": title} for i, title in enumerate([
+        "Zebra", "apple", "Åland Islands", "Abel Tasman", "Spain", "Europe", "Éire", "Earth",
+    ])]
+    original = deepcopy(observation)
+    prompt = policy.build_prompt(observation)
+    assert prompt.split("Available links:\n")[1].split("\n\n")[0].splitlines() == [
+        "- Abel Tasman", "- Åland Islands", "- apple", "- Earth (visited)", "- Éire",
+        "- Europe (current page)", "- Spain (visited)", "- Zebra",
+    ]
+    assert observation == original  # Display order only; environment action IDs are unchanged.
+    calls = policy._tool_calls(observation)
+    assert calls[1] == {"name": "follow_link", "arguments": {"title": "apple"}}
+    assert calls[5] == {"name": "follow_link", "arguments": {"title": "Europe"}}
+
+
+def test_tags_are_never_generated(policy, observation):
+    observation["actions"].append({"id": 5, "title": "Earth"})
+    sequences = policy._action_sequences(policy._tool_calls(observation))
+    for tokens in sequences.values():
+        assert "(visited)" not in policy.tokenizer.decode(tokens)
+        assert "(current page)" not in policy.tokenizer.decode(tokens)
+    assert "- Earth (visited)" in policy.build_prompt(observation)
 
 
 def test_tool_calls_use_titles_and_keep_unicode(policy, observation, monkeypatch):
