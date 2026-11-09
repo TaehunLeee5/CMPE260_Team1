@@ -6,6 +6,7 @@ import platform
 import random
 from importlib.metadata import version
 from pathlib import Path
+from collections import Counter
 from statistics import mean, pstdev
 from time import perf_counter
 
@@ -23,12 +24,44 @@ from training.checkpoint import (capture_rng, read_checkpoint, resolve_resume, r
                                  restore_training_state, save_checkpoint, write_json)
 
 
-def group_advantages(returns, epsilon=1e-4):
-    """Use population std; identical returns always produce exactly zero advantage."""
+def group_advantages(returns, epsilon=1e-4, min_std=None):
+    """Use population std; identical returns always produce exactly zero advantage.
+
+    With min_std, the divisor is max(std, min_std). This keeps groups that differ
+    only by the small efficiency bonus (all routes succeed, lengths differ) from
+    receiving advantages as large as success versus failure. Without it, the
+    original divisor std + epsilon is used.
+    """
     if len(returns) < 2 or not all(math.isfinite(value) for value in returns):
         raise ValueError("Each group needs at least two finite returns.")
+    if min_std is not None and (not math.isfinite(min_std) or min_std <= 0):
+        raise ValueError("min_std must be positive and finite, or None.")
     average, std = mean(returns), pstdev(returns)
-    return [(value - average) / (std + epsilon) for value in returns] if std else [0.0] * len(returns)
+    if not std:
+        return [0.0] * len(returns)
+    divisor = max(std, min_std) if min_std is not None else std + epsilon
+    return [(value - average) / divisor for value in returns]
+
+
+def distance_list(value):
+    """Normalize a distance setting; older runs stored a single integer."""
+    values = [value] if isinstance(value, int) else list(value)
+    if not values or any(type(d) is not int or d < 1 for d in values):
+        raise ValueError("Distances must be positive integers.")
+    return sorted(set(values))
+
+
+def sample_batch_tasks(tasks, distances, count, rng=random):
+    """Pick a distance uniformly for each slot, then distinct tasks at that distance.
+
+    With one distance this is exactly the original random.sample(tasks, count),
+    so runs started before multi-distance training resume identically.
+    """
+    if len(distances) == 1:
+        return rng.sample(tasks, count)
+    by_distance = {d: [t for t in tasks if t["shortest_distance"] == d] for d in distances}
+    per_distance = Counter(rng.choice(distances) for _ in range(count))
+    return [task for d in distances for task in rng.sample(by_distance[d], per_distance[d])]
 
 
 def clipped_token_loss(current, old, advantage, clip_range=0.2):
@@ -81,7 +114,7 @@ def _branch_scores(policy, episode):
 
 
 def grpo_update(policy, groups, optimizer, clip_range=0.2, max_grad_norm=1.0, atol=1e-4,
-                *, check_post_update=True):
+                *, check_post_update=True, min_advantage_std=None):
     """Accumulate one exact masked-token update; reject stale/mismatched behavior scores.
 
     Keep all weights fixed throughout collection and gradient accumulation. Training
@@ -106,7 +139,7 @@ def grpo_update(policy, groups, optimizer, clip_range=0.2, max_grad_norm=1.0, at
     for group in groups:
         if len({(e["start"], e["target"]) for e in group}) != 1:
             raise ValueError("A reward group must contain routes for the same start-target pair.")
-        advantages = group_advantages([e["episode_return"] for e in group])
+        advantages = group_advantages([e["episode_return"] for e in group], min_std=min_advantage_std)
         zero_groups += all(value == 0 for value in advantages)
         rows.extend((episode, advantage, _branch_count(episode)) for episode, advantage in zip(group, advantages))
     active = [(e, a, count) for e, a, count in rows if a != 0 and count]
@@ -202,12 +235,12 @@ def compact_report(groups, max_clicks):
 
 
 DEFAULTS = {
-    "tasks": "data/processed/final_5000/train.json",
-    "val_tasks": "data/processed/final_5000/val.json",
-    "articles": "data/processed/articles.json", "distance": 2,
-    "tasks_per_batch": 4, "rollouts": 4, "seed": 42, "max_clicks": 20,
+    "tasks": "data/processed/final_v2_5000/train.json",
+    "val_tasks": "data/processed/final_v2_5000/val.json",
+    "articles": "data/processed/articles.json", "distance": [2, 3, 4],
+    "tasks_per_batch": 4, "rollouts": 8, "seed": 42, "max_clicks": 20,
     "max_input_tokens": 4096, "learning_rate": 1e-5, "clip_range": 0.2,
-    "max_grad_norm": 1.0, "val_limit": 20, "eval_every": 5,
+    "max_grad_norm": 1.0, "val_limit": 100, "eval_every": 10, "min_advantage_std": 0.1,
 }
 
 
@@ -255,7 +288,7 @@ def run_training(runner, optimizer, tasks, val_tasks, output, batches, config, p
         print(f"Batch {batch}/{batches} | optimizer steps so far: {progress['optimizer_steps']}", flush=True)
         if policy.model.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(policy.model.device)
-        selected = random.sample(tasks, config["tasks_per_batch"])
+        selected = sample_batch_tasks(tasks, distance_list(config["distance"]), config["tasks_per_batch"])
         collected_at = perf_counter()
         groups = collect_groups(runner, selected, config["rollouts"], seed=None)
         collection_seconds = perf_counter() - collected_at
@@ -265,7 +298,8 @@ def run_training(runner, optimizer, tasks, val_tasks, output, batches, config, p
         should_validate = batch % config["eval_every"] == 0 or batch == batches
         updating_at = perf_counter()
         update = grpo_update(policy, groups, optimizer, config["clip_range"], config["max_grad_norm"],
-                             check_post_update=should_validate)
+                             check_post_update=should_validate,
+                             min_advantage_std=config.get("min_advantage_std"))
         update_seconds = perf_counter() - updating_at
         del groups
         validation_at = perf_counter()
@@ -313,10 +347,12 @@ def main():
     parser = argparse.ArgumentParser(description="Train GRPO in fresh batches with validation and batch-boundary resume.")
     for flag in ["tasks", "val_tasks", "articles"]:
         parser.add_argument("--" + flag.replace("_", "-"), type=Path, help=f"Default: {DEFAULTS[flag]}")
-    for flag in ["distance", "tasks_per_batch", "rollouts", "seed", "max_clicks",
+    parser.add_argument("--distance", type=int, nargs="+",
+                        help="Training distances, each chosen with equal probability per task. Default: 2 3 4")
+    for flag in ["tasks_per_batch", "rollouts", "seed", "max_clicks",
                  "max_input_tokens", "val_limit", "eval_every"]:
         parser.add_argument("--" + flag.replace("_", "-"), type=int, help=f"Default: {DEFAULTS[flag]}")
-    for flag in ["learning_rate", "clip_range", "max_grad_norm"]:
+    for flag in ["learning_rate", "clip_range", "max_grad_norm", "min_advantage_std"]:
         parser.add_argument("--" + flag.replace("_", "-"), type=float, help=f"Default: {DEFAULTS[flag]}")
     parser.add_argument("--batches", type=int, help="Total target batches, including completed ones (new run default: 5).")
     parser.add_argument("--output", type=Path, help="A new run directory; inferred on resume.")
@@ -324,6 +360,8 @@ def main():
     args = parser.parse_args()
     supplied = {key: str(value) if isinstance(value, Path) else value
                 for key, value in vars(args).items() if key in DEFAULTS and value is not None}
+    if "distance" in supplied:
+        supplied["distance"] = sorted(set(supplied["distance"]))
     payload = None
     try:
         if args.resume:
@@ -333,9 +371,13 @@ def main():
             config = progress["settings"]
             if args.output is not None and args.output.resolve() != output.resolve():
                 raise ValueError("Resume uses the existing run directory; do not change --output.")
-            changed = [key for key, value in supplied.items()
-                       if (Path(value).resolve() != Path(config[key]).resolve()
-                           if key in ["tasks", "val_tasks", "articles"] else value != config[key])]
+            def differs(key, value):
+                if key in ["tasks", "val_tasks", "articles"]:
+                    return Path(value).resolve() != Path(config[key]).resolve()
+                if key == "distance":
+                    return value != distance_list(config[key])
+                return value != config.get(key)
+            changed = [key for key, value in supplied.items() if differs(key, value)]
             if changed:
                 raise ValueError(f"Cannot change training settings on resume: {', '.join(changed)}")
             batches = args.batches if args.batches is not None else progress["planned_batches"]
@@ -347,19 +389,25 @@ def main():
             output, progress = args.output, None
             config = {**DEFAULTS, **supplied}
             batches = args.batches if args.batches is not None else 5
-        positive = ["distance", "tasks_per_batch", "max_clicks", "max_input_tokens", "val_limit", "eval_every"]
+        distances = distance_list(config["distance"])
+        positive = ["tasks_per_batch", "max_clicks", "max_input_tokens", "val_limit", "eval_every"]
         if batches < 1 or any(config[key] < 1 for key in positive) or config["rollouts"] < 2:
             raise ValueError("Batch counts and budgets must be positive; rollouts must be at least two.")
         if not 0 <= config["seed"] < 2**32 or not 0 < config["clip_range"] < 1:
             raise ValueError("Invalid seed or clipping range.")
         if any(not math.isfinite(config[key]) or config[key] <= 0 for key in ["learning_rate", "max_grad_norm"]):
             raise ValueError("Learning rate and maximum gradient norm must be positive and finite.")
+        floor = config.get("min_advantage_std")
+        if floor is not None and (not math.isfinite(floor) or floor <= 0):
+            raise ValueError("--min-advantage-std must be positive and finite.")
         all_tasks, all_val = read_tasks(config["tasks"]), read_tasks(config["val_tasks"])
         if {(t["start"], t["target"]) for t in all_tasks} & {(t["start"], t["target"]) for t in all_val}:
             raise ValueError("Training and validation task pairs must be disjoint.")
-        tasks = [t for t in all_tasks if t["shortest_distance"] == config["distance"]]
-        if len(tasks) < config["tasks_per_batch"]:
-            raise ValueError("Not enough unique training pairs at the requested distance.")
+        tasks = [t for t in all_tasks if t["shortest_distance"] in distances]
+        short = [d for d in distances
+                 if sum(t["shortest_distance"] == d for t in tasks) < config["tasks_per_batch"]]
+        if short:
+            raise ValueError(f"Fewer than --tasks-per-batch training pairs at distance(s): {short}")
         val_tasks = random.Random(config["seed"]).sample(all_val, min(config["val_limit"], len(all_val)))
         hashes = {key: file_hash(config[key]) for key in ["tasks", "val_tasks", "articles"]}
         if payload and (hashes != config["data_sha256"] or val_tasks != progress["validation_tasks"]):
@@ -400,7 +448,9 @@ def main():
         else:
             config.update(
                 algorithm="constrained_token_grpo", kl_beta=0.0, advantage_std_correction=0,
-                advantage_epsilon=1e-4, loss_normalization="mean_branch_tokens_per_route_then_mean_all_routes",
+                advantage_epsilon=None, advantage_divisor="max(population_std, min_advantage_std)",
+                distance_sampling="uniform_over_distances_then_uniform_task",
+                loss_normalization="mean_branch_tokens_per_route_then_mean_all_routes",
                 optimizer_steps_per_batch=1, gradient_checkpointing="non_reentrant",
                 post_update_checks="validation_batches", data_sha256=hashes, runtime=runtime,
                 training_metrics_phase="before_optimizer_step", validation_metrics_phase="after_optimizer_step",
