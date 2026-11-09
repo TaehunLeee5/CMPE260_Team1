@@ -114,5 +114,6 @@ def test_defaults_match_final_training_setup():
     assert grpo.DEFAULTS["distance"] == [2, 3, 4]
     assert grpo.DEFAULTS["rollouts"] == 8 and grpo.DEFAULTS["tasks_per_batch"] == 4
     assert grpo.DEFAULTS["min_advantage_std"] == 0.1
+    assert grpo.DEFAULTS["update_epochs"] == 2
     assert grpo.DEFAULTS["val_limit"] == 100 and grpo.DEFAULTS["eval_every"] == 10
     assert "final_v2_5000" in grpo.DEFAULTS["tasks"] and "final_v2_5000" in grpo.DEFAULTS["val_tasks"]

@@ -114,17 +114,77 @@ def _step_branch_scores(policy, step):
     return [(scores[i], step["token_log_probs"][i]) for i in positions]
 
 
-def grpo_update(policy, groups, optimizer, clip_range=0.2, max_grad_norm=1.0, atol=1e-4,
-                *, check_post_update=True, min_advantage_std=None):
-    """Accumulate one exact masked-token update; reject stale/mismatched behavior scores.
+def _later_epoch(policy, optimizer, active, routes, trainable, frozen, clip_range, max_grad_norm, epoch):
+    """One more clipped update on the same batch; the policy has moved since collection.
 
-    Keep all weights fixed throughout collection and gradient accumulation. Training
-    mode activates non-reentrant layer checkpointing; Qwen and adapter dropout must
-    both be zero. Rollouts and post-update checks run in evaluation mode.
+    The recorded behavior probabilities stay the "old" ones, so ratios now differ
+    from 1 and clipping is active. A token counts as clipped when the clamp removes
+    its gradient: positive advantage with ratio > 1 + clip, or negative advantage
+    with ratio < 1 - clip.
+    """
+    started = perf_counter()
+    stats = {"epoch": epoch, "optimizer_step_applied": False, "loss": 0.0, "branch_tokens": 0,
+             "clipped_fraction": 0.0, "ratio_mean": None, "ratio_min": None, "ratio_max": None,
+             "gradient_norm_before_clipping": None}
+    ratios, clipped = [], 0
+    optimizer.zero_grad(set_to_none=True)
+    policy.model.train()
+    with tqdm(total=sum(count for _, _, count in active), desc=f"Epoch {epoch} gradients", unit="token") as progress:
+        for episode, advantage, count in active:
+            for step in episode["steps"]:
+                branches = _step_branch_scores(policy, step)
+                if not branches:
+                    continue
+                loss = 0
+                for current, old in branches:
+                    ratio = math.exp(current.detach().item() - old)
+                    if not math.isfinite(ratio):
+                        raise RuntimeError("A probability ratio became nonfinite; optimizer was not stepped.")
+                    ratios.append(ratio)
+                    clipped += (advantage > 0 and ratio > 1 + clip_range) or (advantage < 0 and ratio < 1 - clip_range)
+                    loss = loss + clipped_token_loss(current, current.new_tensor(old), advantage, clip_range)
+                loss = loss / (count * routes)
+                if not torch.isfinite(loss):
+                    raise RuntimeError("Nonfinite GRPO loss; optimizer was not stepped.")
+                loss.backward()
+                stats["loss"] += loss.detach().item()
+                progress.update(len(branches))
+    if any(p.grad is not None for p, _ in frozen):
+        raise RuntimeError("A frozen base parameter received a gradient.")
+    stats.update(branch_tokens=len(ratios), clipped_fraction=clipped / len(ratios),
+                 ratio_mean=mean(ratios), ratio_min=min(ratios), ratio_max=max(ratios))
+    norm = torch.nn.utils.clip_grad_norm_(trainable, max_grad_norm, error_if_nonfinite=True)
+    stats["gradient_norm_before_clipping"] = norm.item()
+    if norm.item() > 0:
+        optimizer.step()
+        stats["optimizer_step_applied"] = True
+        if not all(p._version == before for p, before in frozen) or not all(torch.isfinite(p).all() for p in trainable):
+            raise RuntimeError("Frozen weights changed or adapter values became nonfinite.")
+    else:
+        stats["skip_reason"] = "Every active token was clipped, so the gradient is zero."
+    optimizer.zero_grad(set_to_none=True)
+    stats["seconds"] = perf_counter() - started
+    return stats
+
+
+def grpo_update(policy, groups, optimizer, clip_range=0.2, max_grad_norm=1.0, atol=1e-4,
+                *, check_post_update=True, min_advantage_std=None, update_epochs=1):
+    """Accumulate exact masked-token updates; reject stale/mismatched behavior scores.
+
+    The first epoch runs on-policy, so every recorded behavior probability must be
+    reproduced within atol before the first optimizer step. With update_epochs > 1,
+    each later epoch takes one more clipped step on the same batch (see _later_epoch).
+
+    Keep all weights fixed throughout collection and first-epoch gradient
+    accumulation. Training mode activates non-reentrant layer checkpointing; Qwen
+    and adapter dropout must both be zero. Rollouts and post-update checks run in
+    evaluation mode.
     """
     started = perf_counter()
     if not groups or not 0 < clip_range < 1 or max_grad_norm <= 0:
         raise ValueError("Provide groups, a clip range in (0, 1), and a positive gradient norm limit.")
+    if type(update_epochs) is not int or update_epochs < 1:
+        raise ValueError("update_epochs must be a positive integer.")
     named = [(name, p) for name, p in policy.model.named_parameters() if p.requires_grad]
     if not named or any("lora_" not in name for name, _ in named):
         raise ValueError("Only LoRA adapter parameters may be trainable.")
@@ -153,6 +213,7 @@ def grpo_update(policy, groups, optimizer, clip_range=0.2, max_grad_norm=1.0, at
         "gradient_norm_before_clipping": None, "adapters_changed": False,
         "initial_probability_checks_passed": None,
         "post_update_token_ratio": None,
+        "update_epochs": update_epochs, "optimizer_steps": 0, "later_epochs": [],
         "max_sampling_rescore_error": max(
             (step.get("sampling_max_abs_error", 0.0) for e, _, _ in rows for step in e["steps"]), default=0.0),
         "timings": {"gradient_seconds": 0.0, "post_check_seconds": 0.0},
@@ -199,6 +260,14 @@ def grpo_update(policy, groups, optimizer, clip_range=0.2, max_grad_norm=1.0, at
             return result
         optimizer.step()
         result["optimizer_step_applied"] = True
+        result["optimizer_steps"] = 1
+        for epoch in range(2, update_epochs + 1):
+            stats = _later_epoch(policy, optimizer, active, len(rows), trainable, frozen,
+                                 clip_range, max_grad_norm, epoch)
+            result["later_epochs"].append(stats)
+            if not stats["optimizer_step_applied"]:
+                break  # Everything is clipped; further epochs would also be zero.
+            result["optimizer_steps"] += 1
         result["adapters_changed"] = any(not torch.equal(p.detach(), before) for p, before in zip(trainable, initial))
         result["base_parameter_versions_unchanged"] = all(p._version == before for p, before in frozen)
         if not result["base_parameter_versions_unchanged"] or not all(torch.isfinite(p).all() for p in trainable):
@@ -252,6 +321,7 @@ DEFAULTS = {
     "tasks_per_batch": 4, "rollouts": 8, "seed": 42, "max_clicks": 20,
     "max_input_tokens": 4096, "learning_rate": 1e-5, "clip_range": 0.2,
     "max_grad_norm": 1.0, "val_limit": 100, "eval_every": 10, "min_advantage_std": 0.1,
+    "update_epochs": 2,
 }
 
 
@@ -310,7 +380,8 @@ def run_training(runner, optimizer, tasks, val_tasks, output, batches, config, p
         updating_at = perf_counter()
         update = grpo_update(policy, groups, optimizer, config["clip_range"], config["max_grad_norm"],
                              check_post_update=should_validate,
-                             min_advantage_std=config.get("min_advantage_std"))
+                             min_advantage_std=config.get("min_advantage_std"),
+                             update_epochs=config.get("update_epochs", 1))
         update_seconds = perf_counter() - updating_at
         del groups
         validation_at = perf_counter()
@@ -319,7 +390,7 @@ def run_training(runner, optimizer, tasks, val_tasks, output, batches, config, p
         if validation:
             print("Validation:", json.dumps(validation["summary"]), flush=True)
         progress["completed_batches"] = batch
-        progress["optimizer_steps"] += int(update["optimizer_step_applied"])
+        progress["optimizer_steps"] += update.get("optimizer_steps", int(update["optimizer_step_applied"]))
         progress["training_routes"] += len(report["episodes"])
         checkpoint = f"checkpoints/batch_{batch:06d}"
         row = {
@@ -361,7 +432,7 @@ def main():
     parser.add_argument("--distance", type=int, nargs="+",
                         help="Training distances, each chosen with equal probability per task. Default: 2 3 4")
     for flag in ["tasks_per_batch", "rollouts", "seed", "max_clicks",
-                 "max_input_tokens", "val_limit", "eval_every"]:
+                 "max_input_tokens", "val_limit", "eval_every", "update_epochs"]:
         parser.add_argument("--" + flag.replace("_", "-"), type=int, help=f"Default: {DEFAULTS[flag]}")
     for flag in ["learning_rate", "clip_range", "max_grad_norm", "min_advantage_std"]:
         parser.add_argument("--" + flag.replace("_", "-"), type=float, help=f"Default: {DEFAULTS[flag]}")
@@ -402,6 +473,8 @@ def main():
             batches = args.batches if args.batches is not None else 5
         distances = distance_list(config["distance"])
         positive = ["tasks_per_batch", "max_clicks", "max_input_tokens", "val_limit", "eval_every"]
+        if config.get("update_epochs", 1) < 1:
+            raise ValueError("--update-epochs must be at least 1.")
         if batches < 1 or any(config[key] < 1 for key in positive) or config["rollouts"] < 2:
             raise ValueError("Batch counts and budgets must be positive; rollouts must be at least two.")
         if not 0 <= config["seed"] < 2**32 or not 0 < config["clip_range"] < 1:
@@ -464,7 +537,7 @@ def main():
                 rollout_decoder="kv_cached_sampling_then_teacher_forced_rescore",
                 training_scorer="one_teacher_forced_pass_per_step",
                 loss_normalization="mean_branch_tokens_per_route_then_mean_all_routes",
-                optimizer_steps_per_batch=1, gradient_checkpointing="non_reentrant",
+                optimizer_steps_per_batch=config["update_epochs"], gradient_checkpointing="non_reentrant",
                 post_update_checks="validation_batches", data_sha256=hashes, runtime=runtime,
                 training_metrics_phase="before_optimizer_step", validation_metrics_phase="after_optimizer_step",
                 system_prompt=policy.system_prompt, observation_template=policy.observation_template,

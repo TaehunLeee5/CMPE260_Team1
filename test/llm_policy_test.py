@@ -843,6 +843,125 @@ def test_grpo_update_uses_one_forward_pass_per_step(policy, observation, monkeyp
     assert result["max_sampling_rescore_error"] < 1e-5
 
 
+def lora_actor(policy):
+    actor = WikiGamePolicy(model=deepcopy(policy.model), tokenizer=policy.tokenizer)
+    actor.enable_lora()
+    actor.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    return actor
+
+
+def adapter_weights(actor):
+    return {n: p.detach().clone() for n, p in actor.model.named_parameters() if p.requires_grad}
+
+
+def test_second_epoch_equals_a_manual_clipped_step(policy, observation, monkeypatch):
+    first = lora_actor(policy)
+    group = controlled_grpo_group(first, observation, monkeypatch)
+    second = WikiGamePolicy(model=deepcopy(first.model), tokenizer=policy.tokenizer)
+    make = lambda actor: torch.optim.AdamW(
+        (p for p in actor.model.parameters() if p.requires_grad), lr=0.05, weight_decay=0)
+
+    optimizer = make(first)
+    result = grpo_update(first, [group], optimizer, max_grad_norm=1e9, atol=1e-5,
+                         check_post_update=False, update_epochs=2)
+    assert result["optimizer_steps"] == 2 and len(result["later_epochs"]) == 1
+
+    # Reference: one epoch through grpo_update, then the second step written out by hand.
+    reference_optimizer = make(second)
+    grpo_update(second, [group], reference_optimizer, max_grad_norm=1e9, atol=1e-5,
+                check_post_update=False, update_epochs=1)
+    second.model.train()
+    advantages = group_advantages([e["episode_return"] for e in group])
+    loss = 0
+    for episode, advantage in zip(group, advantages):
+        step = episode["steps"][0]
+        mask = torch.tensor([len(c) > 1 for c in step["token_choices"]])
+        current = second.get_token_log_probs(step["prompt_ids"], step["token_ids"], step["token_choices"])
+        old = torch.tensor(step["token_log_probs"])
+        loss = loss + clipped_token_loss(current[mask], old[mask], advantage).sum() / (int(mask.sum()) * len(group))
+    loss.backward()
+    reference_optimizer.step()
+    second.model.eval()
+    assert result["later_epochs"][0]["loss"] == pytest.approx(loss.item(), abs=1e-6)
+    expected, actual = adapter_weights(second), adapter_weights(first)
+    assert expected.keys() == actual.keys()
+    for name in expected:
+        assert torch.allclose(actual[name], expected[name], atol=1e-6, rtol=1e-5), name
+    assert not first.model.training
+
+
+def test_later_epochs_report_ratios_and_clipping(policy, observation, monkeypatch):
+    actor = lora_actor(policy)
+    group = controlled_grpo_group(actor, observation, monkeypatch)
+    optimizer = torch.optim.AdamW((p for p in actor.model.parameters() if p.requires_grad), lr=0.5)
+    result = grpo_update(actor, [group], optimizer, max_grad_norm=1e9, atol=1e-5,
+                         check_post_update=True, update_epochs=3)
+    later = result["later_epochs"]
+    assert later and later[0]["epoch"] == 2
+    for stats in later:
+        assert 0 <= stats["clipped_fraction"] <= 1 and stats["branch_tokens"] > 0
+        assert stats["ratio_min"] <= stats["ratio_mean"] <= stats["ratio_max"]
+    assert result["optimizer_steps"] == 1 + sum(s["optimizer_step_applied"] for s in later)
+    assert result["post_update_token_ratio"] is not None
+    assert json.loads(json.dumps(result, allow_nan=False)) == result
+
+
+def test_later_epoch_clips_only_tokens_already_pushed_far_enough(policy, observation, monkeypatch):
+    from training.grpo import _branch_count, _later_epoch
+
+    actor = lora_actor(policy)
+    group = controlled_grpo_group(actor, observation, monkeypatch)
+    # Pretend the policy already raised every chosen token's probability by e^0.5 (ratio 1.65).
+    for episode in group:
+        for step in episode["steps"]:
+            step["token_log_probs"] = [x - 0.5 if len(c) > 1 else x
+                                       for x, c in zip(step["token_log_probs"], step["token_choices"])]
+    advantages = group_advantages([e["episode_return"] for e in group])
+    assert advantages[0] > 0 > advantages[1]
+    active = [(e, a, _branch_count(e)) for e, a in zip(group, advantages)]
+    trainable = [p for p in actor.model.parameters() if p.requires_grad]
+    frozen = [(p, p._version) for p in actor.model.parameters() if not p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable, lr=1e-3)
+    stats = _later_epoch(actor, optimizer, active, len(group), trainable, frozen, 0.2, 1e9, 2)
+    positive_tokens, negative_tokens = active[0][2], active[1][2]
+    # Positive advantage and ratio > 1.2: clipped (no gradient). Negative advantage: not clipped.
+    assert stats["clipped_fraction"] == pytest.approx(positive_tokens / (positive_tokens + negative_tokens))
+    assert stats["ratio_min"] == pytest.approx(math.exp(0.5), abs=1e-4)
+    assert stats["ratio_max"] == pytest.approx(math.exp(0.5), abs=1e-4)
+    assert stats["optimizer_step_applied"]
+
+    # If every token is clipped, the gradient is zero and no step is taken.
+    before = [p.detach().clone() for p in trainable]
+    only_positive = [active[0]]
+    stats = _later_epoch(actor, optimizer, only_positive, len(group), trainable, frozen, 0.2, 1e9, 3)
+    assert stats["clipped_fraction"] == 1 and not stats["optimizer_step_applied"]
+    assert all(torch.equal(p.detach(), b) for p, b in zip(trainable, before))
+
+
+def test_each_epoch_uses_one_forward_pass_per_step(policy, observation, monkeypatch):
+    actor = lora_actor(policy)
+    group = controlled_grpo_group(actor, observation, monkeypatch)
+    steps = sum(any(len(c) > 1 for c in s["token_choices"]) for e in group for s in e["steps"])
+    optimizer = torch.optim.AdamW((p for p in actor.model.parameters() if p.requires_grad), lr=1e-4)
+    calls, hook = count_forwards(actor.model)
+    try:
+        result = grpo_update(actor, [group], optimizer, max_grad_norm=1e9, atol=1e-5,
+                             check_post_update=False, update_epochs=2)
+    finally:
+        hook.remove()
+    assert result["optimizer_steps"] == 2
+    assert len(calls) == 2 * steps
+
+
+@pytest.mark.parametrize("epochs", [0, -1, 1.5])
+def test_invalid_update_epochs_rejected(policy, observation, monkeypatch, epochs):
+    actor = lora_actor(policy)
+    group = controlled_grpo_group(actor, observation, monkeypatch)
+    optimizer = torch.optim.AdamW((p for p in actor.model.parameters() if p.requires_grad), lr=1e-4)
+    with pytest.raises(ValueError, match="update_epochs"):
+        grpo_update(actor, [group], optimizer, update_epochs=epochs)
+
+
 def test_grpo_skips_constant_reward_groups(policy, observation, monkeypatch):
     actor = WikiGamePolicy(model=deepcopy(policy.model), tokenizer=policy.tokenizer)
     actor.enable_lora()
