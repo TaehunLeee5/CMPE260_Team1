@@ -58,23 +58,25 @@ def test_cli_manifest_and_no_overwrite(tmp_path, graph):
     )
     order = tmp_path / "article_order.json"
     order.write_text(json.dumps(ids), encoding="utf-8")
-    previous = tmp_path / "previous"
-    previous.mkdir()
-    for name in ["train", "val", "test"]:
-        rows = [{"start": ids[0], "target": ids[1]}] if name == "train" else []
-        (previous / f"{name}.json").write_text(json.dumps(rows), encoding="utf-8")
+    previous, older = tmp_path / "previous", tmp_path / "older"
+    for folder, pair in [(previous, (ids[0], ids[1])), (older, (ids[2], ids[3]))]:
+        folder.mkdir()
+        for name in ["train", "val", "test"]:
+            rows = [{"start": pair[0], "target": pair[1]}] if name == "test" else []
+            (folder / f"{name}.json").write_text(json.dumps(rows), encoding="utf-8")
     output = tmp_path / "experiment"
     args = [
         sys.executable, "-m", "data.splits",
         "--graph-folder", str(graph_folder), "--article-order", str(order),
-        "--previous-splits", str(previous), "--output", str(output),
+        "--previous-splits", str(previous), str(older), "--output", str(output),
         "--num-tasks", "40", "--pilot-size", "12",
     ]
     root = Path(__file__).resolve().parents[1]
     result = subprocess.run(args, cwd=root, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["excluded_previous_pair_count"] == 1
+    assert manifest["excluded_previous_pair_count"] == 2
+    assert len(manifest["previous_split_files"]) == 6
     assert all(manifest["checks"].values())
     all_pairs = set()
     for name, entry in manifest["splits"].items():
@@ -85,7 +87,7 @@ def test_cli_manifest_and_no_overwrite(tmp_path, graph):
         if name in {"train", "val", "test"}:
             all_pairs.update(splits.pair_set(rows))
     assert len(all_pairs) == 40
-    assert (ids[0], ids[1]) not in all_pairs
+    assert (ids[0], ids[1]) not in all_pairs and (ids[2], ids[3]) not in all_pairs
 
     before = {path.name: path.read_bytes() for path in output.iterdir()}
     retry = subprocess.run(args, cwd=root, capture_output=True, text=True)
