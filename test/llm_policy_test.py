@@ -217,8 +217,7 @@ def test_single_legal_call_has_probability_one(policy, observation, back_only):
         observation.update(back_available=False, back_action_id=None, back_destination=None)
         observation["actions"] = [{"id": 100, "title": "France"}]
         expected = 100
-    forwards = []
-    hook = policy.model.register_forward_pre_hook(lambda module, inputs: forwards.append(1))
+    forwards, hook = count_forwards(policy.model)
     try:
         decision = policy.choose_action(observation)
     finally:
@@ -320,8 +319,8 @@ def test_pretrained_rollout_and_training_match(real_policy, observation, determi
     print("Tool:", decision["tool_call"], "log probability:", decision["log_prob"])
     if not deterministic:
         # Cached draw probabilities versus the recorded teacher-forced ones (bf16 rounding).
-        print("Sampling vs recorded max abs error:", decision["sampling_max_abs_error"])
-        assert decision["sampling_max_abs_error"] < 0.1
+        print("Sampling vs recorded abs errors:", decision["sampling_abs_errors"])
+        assert decision["sampling_max_abs_error"] < 0.05
 
 
 @pytest.mark.integration
@@ -372,8 +371,10 @@ def test_forward_passes_only_at_branching_prefixes(policy, observation):
 
 
 def count_forwards(model):
+    """Count transformer passes; the scorers call the body directly, below any wrapper."""
+    body = model.get_base_model().model if isinstance(model, PeftModel) else model.model
     calls = []
-    return calls, model.register_forward_pre_hook(lambda module, inputs: calls.append(1))
+    return calls, body.register_forward_pre_hook(lambda module, inputs: calls.append(1))
 
 
 def test_sampled_decision_uses_cache_then_one_rescore(policy, observation):

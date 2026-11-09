@@ -173,6 +173,31 @@ class WikiGamePolicy:
         ).logits[0, -1].float()
         return torch.log_softmax(logits[choices], dim=-1)
 
+    def _decoder(self):
+        """The transformer body (LoRA layers are injected in place) and its output layer."""
+        base = self.model.get_base_model() if isinstance(self.model, PeftModel) else self.model
+        return base.model, base.get_output_embeddings()
+
+    def _hidden(self, input_ids, past_key_values=None, use_cache=False):
+        """Final normalized hidden states; the full-vocabulary logits are never formed."""
+        body, _ = self._decoder()
+        ids = torch.tensor([input_ids], device=self.model.device, dtype=torch.long)
+        output = body(input_ids=ids, past_key_values=past_key_values, use_cache=use_cache)
+        return output.last_hidden_state[0], output.past_key_values
+
+    def _choice_log_probs(self, hidden, choices):
+        """Log probabilities over the legal tokens, with the output layer in float32.
+
+        bfloat16 logits of size 16-64 are rounded to steps of 0.125-0.25, so two
+        computations that accumulate in a different order can disagree by whole
+        rounding steps. Scoring only the legal rows in float32 removes that.
+        """
+        _, head = self._decoder()
+        logits = hidden.float() @ head.weight[choices].float().T
+        if head.bias is not None:
+            logits = logits + head.bias[choices].float()
+        return torch.log_softmax(logits, dim=-1)
+
     def _sample_cached(self, prompt_ids, sequences):
         """Sample one legal call, reusing a KV cache between branching points.
 
@@ -190,12 +215,9 @@ class WikiGamePolicy:
             if len(choices) == 1:
                 token, score = choices[0], 0.0
             else:
-                output = self.model(
-                    input_ids=torch.tensor([pending], device=self.model.device, dtype=torch.long),
-                    past_key_values=cache, use_cache=True, logits_to_keep=1,
-                )
-                cache, pending = output.past_key_values, []
-                log_probs = torch.log_softmax(output.logits[0, -1].float()[choices], dim=-1)
+                hidden, cache = self._hidden(pending, past_key_values=cache, use_cache=True)
+                pending = []
+                log_probs = self._choice_log_probs(hidden[-1], choices)
                 index = torch.multinomial(log_probs.exp(), num_samples=1).item()
                 token, score = choices[index], log_probs[index].item()
             tokens.append(token)
@@ -235,12 +257,14 @@ class WikiGamePolicy:
                 scores = self._step_log_probs(prompt_ids, tokens, token_choices).tolist()
             else:
                 scores = [0.0] * len(tokens)
+            errors = [abs(a - b) for a, b, c in zip(sampled, scores, token_choices) if len(c) > 1]
             return {
                 "action": action, "tool_call": calls[action], "prompt_ids": prompt_ids,
                 "token_ids": tokens, "token_choices": token_choices,
                 "token_log_probs": scores,
                 "log_prob": torch.tensor(scores, device=self.model.device, dtype=torch.float32).sum().item(),
-                "sampling_max_abs_error": max(abs(a - b) for a, b in zip(sampled, scores)),
+                "sampling_abs_errors": errors,
+                "sampling_max_abs_error": max(errors, default=0.0),
             }
         tokens, token_choices, scores = [], [], []
         for _ in range(max(map(len, sequences.values()))):
@@ -274,8 +298,8 @@ class WikiGamePolicy:
         """Score a whole recorded call with one teacher-forced forward pass.
 
         The model reads the prompt plus every recorded token except the last; the
-        logits at the final len(token_ids) positions predict each recorded token.
-        Forced tokens contribute zero.
+        hidden states at the final len(token_ids) positions predict each recorded
+        token, scored over its legal tokens in float32. Forced tokens contribute zero.
         """
         if not prompt_ids or not token_ids or len(token_ids) != len(token_choices):
             raise ValueError("Provide a prompt and matching token/mask sequences.")
@@ -286,18 +310,12 @@ class WikiGamePolicy:
         branches = [i for i, choices in enumerate(token_choices) if len(choices) > 1]
         if not branches:
             return torch.stack([zero] * len(token_ids))
-        input_ids = torch.tensor(
-            [prompt_ids + token_ids[:-1]], device=self.model.device, dtype=torch.long,
-        )
-        logits = self.model(
-            input_ids=input_ids, attention_mask=torch.ones_like(input_ids),
-            use_cache=False, logits_to_keep=len(token_ids),
-        ).logits[0]
+        hidden, _ = self._hidden(prompt_ids + token_ids[:-1])
+        hidden = hidden[-len(token_ids):]  # Row i predicts token_ids[i].
         scores = [zero] * len(token_ids)
         for i in branches:
             choices = token_choices[i]
-            log_probs = torch.log_softmax(logits[i].float()[choices], dim=-1)
-            scores[i] = log_probs[choices.index(token_ids[i])]
+            scores[i] = self._choice_log_probs(hidden[i], choices)[choices.index(token_ids[i])]
         return torch.stack(scores)
 
     def get_token_log_probs(self, prompt_ids, token_ids, token_choices):

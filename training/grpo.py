@@ -105,6 +105,17 @@ def _branch_count(episode):
     return count
 
 
+def _error_summary(errors):
+    """Distribution of |sampling - recorded| log-probability gaps over decision tokens."""
+    if not errors:
+        return None
+    ordered = sorted(errors)
+    return {"decision_tokens": len(ordered), "mean": mean(ordered),
+            "p95": ordered[min(len(ordered) - 1, int(0.95 * len(ordered)))], "max": ordered[-1],
+            "fraction_above_0.01": mean(x > 0.01 for x in ordered),
+            "fraction_above_0.1": mean(x > 0.1 for x in ordered)}
+
+
 def _step_branch_scores(policy, step):
     """Score one recorded step in a single forward pass; return (current, old) per branch token."""
     positions = [i for i, choices in enumerate(step["token_choices"]) if len(choices) > 1]
@@ -216,6 +227,8 @@ def grpo_update(policy, groups, optimizer, clip_range=0.2, max_grad_norm=1.0, at
         "update_epochs": update_epochs, "optimizer_steps": 0, "later_epochs": [],
         "max_sampling_rescore_error": max(
             (step.get("sampling_max_abs_error", 0.0) for e, _, _ in rows for step in e["steps"]), default=0.0),
+        "sampling_rescore_error": _error_summary(
+            [x for e, _, _ in rows for step in e["steps"] for x in step.get("sampling_abs_errors", [])]),
         "timings": {"gradient_seconds": 0.0, "post_check_seconds": 0.0},
     }
     optimizer.zero_grad(set_to_none=True)
@@ -535,6 +548,7 @@ def main():
                 advantage_epsilon=None, advantage_divisor="max(population_std, min_advantage_std)",
                 distance_sampling="uniform_over_distances_then_uniform_task",
                 rollout_decoder="kv_cached_sampling_then_teacher_forced_rescore",
+                choice_logits="float32_output_layer_over_legal_tokens",
                 training_scorer="one_teacher_forced_pass_per_step",
                 loss_normalization="mean_branch_tokens_per_route_then_mean_all_routes",
                 optimizer_steps_per_batch=config["update_epochs"], gradient_checkpointing="non_reentrant",
