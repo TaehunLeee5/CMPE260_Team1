@@ -63,7 +63,7 @@ def observation():
     }
 
 
-def assert_decision(policy, observation, decision, atol=1e-5, reference=False):
+def assert_decision(policy, observation, decision, atol=1e-5, reference=False, replay=False):
     calls = policy._tool_calls(observation)
     assert decision["tool_call"] == calls[decision["action"]]
     assert json.loads(json.dumps(decision)) == decision
@@ -77,6 +77,8 @@ def assert_decision(policy, observation, decision, atol=1e-5, reference=False):
             rescored = torch.stack(list(policy.iter_token_log_probs(
                 decision["prompt_ids"], tokens, decision["token_choices"],
             )))
+        elif replay:
+            rescored = policy._replay_log_probs(decision["prompt_ids"], tokens, decision["token_choices"])
         else:
             rescored = policy.get_token_log_probs(
                 decision["prompt_ids"], tokens, decision["token_choices"],
@@ -314,13 +316,36 @@ def real_policy():
 @pytest.mark.parametrize("deterministic", [False, True])
 def test_pretrained_rollout_and_training_match(real_policy, observation, deterministic):
     decision = real_policy.choose_action(observation, deterministic)
-    # Greedy decisions use per-prefix passes; sampled decisions record the training scorer.
-    assert_decision(real_policy, observation, decision, atol=1e-4, reference=deterministic)
+    # Greedy decisions record their cached computation (replayed exactly); sampled
+    # decisions record the teacher-forced training scorer.
+    assert_decision(real_policy, observation, decision, atol=1e-4, replay=deterministic)
     print("Tool:", decision["tool_call"], "log probability:", decision["log_prob"])
     if not deterministic:
         # Cached draw probabilities versus the recorded teacher-forced ones (bf16 rounding).
         print("Sampling vs recorded abs errors:", decision["sampling_abs_errors"])
         assert decision["sampling_max_abs_error"] < 0.05
+
+
+@pytest.mark.integration
+def test_pretrained_replay_is_exact(real_policy, observation):
+    real_policy.replay_scoring = True
+    try:
+        for long_context in [False, True]:
+            if long_context:
+                observation["text"] = "Article context. " * 2000
+            decision = real_policy.choose_action(observation, deterministic=False)
+            real_policy.model.train()
+            try:
+                with torch.enable_grad():
+                    replayed = real_policy.get_token_log_probs(
+                        decision["prompt_ids"], decision["token_ids"], decision["token_choices"])
+            finally:
+                real_policy.model.eval()
+            error = (replayed.detach().cpu() - torch.tensor(decision["token_log_probs"])).abs().max().item()
+            print("Replay vs sampling max abs error:", error, "long context:", long_context)
+            assert error <= 1e-4
+    finally:
+        real_policy.replay_scoring = False
 
 
 @pytest.mark.integration
@@ -358,16 +383,35 @@ def force_action(policy, observation, action, monkeypatch):
     monkeypatch.setattr(torch, "multinomial", draw)
 
 
-def test_forward_passes_only_at_branching_prefixes(policy, observation):
-    forwards = []
-    hook = policy.model.register_forward_pre_hook(lambda module, inputs: forwards.append(1))
+@pytest.mark.parametrize("cached", [True, False])
+def test_forward_passes_only_at_branching_prefixes(policy, observation, cached):
+    policy.cached_greedy = cached
     try:
-        decision = policy.choose_action(observation, deterministic=True)
+        forwards, hook = count_forwards(policy.model)
+        try:
+            decision = policy.choose_action(observation, deterministic=True)
+        finally:
+            hook.remove()
     finally:
-        hook.remove()
+        policy.cached_greedy = True
     decisions = sum(len(choices) > 1 for choices in decision["token_choices"])
     assert len(forwards) == decisions
     assert decisions < len(decision["token_ids"])
+
+
+def test_cached_and_uncached_greedy_agree(policy, observation):
+    cached = policy.choose_action(observation, deterministic=True)
+    policy.cached_greedy = False
+    try:
+        uncached = policy.choose_action(observation, deterministic=True)
+    finally:
+        policy.cached_greedy = True
+    assert cached["token_ids"] == uncached["token_ids"] and cached["action"] == uncached["action"]
+    assert cached["token_log_probs"] == pytest.approx(uncached["token_log_probs"], abs=1e-5)
+    # Greedy decisions record the probabilities they were chosen from.
+    with torch.no_grad():
+        replayed = policy._replay_log_probs(cached["prompt_ids"], cached["token_ids"], cached["token_choices"])
+    assert replayed.tolist() == pytest.approx(cached["token_log_probs"], abs=1e-6)
 
 
 def count_forwards(model):
@@ -963,6 +1007,88 @@ def test_invalid_update_epochs_rejected(policy, observation, monkeypatch, epochs
         grpo_update(actor, [group], optimizer, update_epochs=epochs)
 
 
+def replay_actor(policy):
+    actor = WikiGamePolicy(model=deepcopy(policy.model), tokenizer=policy.tokenizer)
+    actor.enable_lora()
+    actor.replay_scoring = True  # No activation checkpointing in this mode.
+    return actor
+
+
+def test_replay_records_sampling_probabilities_without_rescoring(policy, observation):
+    actor = replay_actor(policy)
+    calls, hook = count_forwards(actor.model)
+    try:
+        decision = actor.choose_action(observation, deterministic=False)
+    finally:
+        hook.remove()
+    branches = sum(len(c) > 1 for c in decision["token_choices"])
+    assert branches > 0 and len(calls) == branches  # Cached passes only; no rescoring pass.
+    assert decision["sampling_max_abs_error"] == 0
+    actor.model.train()
+    with torch.enable_grad():
+        replayed = actor.get_token_log_probs(
+            decision["prompt_ids"], decision["token_ids"], decision["token_choices"])
+    actor.model.eval()
+    assert replayed.requires_grad
+    assert replayed.detach().tolist() == pytest.approx(decision["token_log_probs"], abs=1e-6)
+
+
+def test_replay_matches_teacher_forced_scores(policy, observation):
+    actor = replay_actor(policy)
+    for _ in range(3):
+        decision = actor.choose_action(observation, deterministic=False)
+        args = decision["prompt_ids"], decision["token_ids"], decision["token_choices"]
+        with torch.no_grad():
+            replayed = actor._replay_log_probs(*args)
+            forced = actor._step_log_probs(*args)
+        assert torch.allclose(replayed, forced, atol=1e-5)
+
+
+def test_replay_refuses_activation_checkpointing(policy, observation):
+    actor = replay_actor(policy)
+    actor.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    decision = actor.choose_action(observation, deterministic=False)
+    actor.model.train()
+    try:
+        with torch.enable_grad(), pytest.raises(ValueError, match="checkpointing off"):
+            actor.get_token_log_probs(decision["prompt_ids"], decision["token_ids"], decision["token_choices"])
+    finally:
+        actor.model.eval()
+
+
+@pytest.mark.parametrize("epochs", [1, 2])
+def test_grpo_update_with_replay_matches_teacher_forced(policy, observation, monkeypatch, epochs):
+    replay = replay_actor(policy)
+    group = controlled_grpo_group(replay, observation, monkeypatch)
+    forced = WikiGamePolicy(model=deepcopy(replay.model), tokenizer=policy.tokenizer)
+    make = lambda actor: torch.optim.AdamW(
+        (p for p in actor.model.parameters() if p.requires_grad), lr=0.05, weight_decay=0)
+    branches = sum(len(c) > 1 for e in group for step in e["steps"] for c in step["token_choices"])
+    calls, hook = count_forwards(replay.model)
+    try:
+        result = grpo_update(replay, [group], make(replay), max_grad_norm=1e9, atol=1e-5,
+                             check_post_update=False, update_epochs=epochs)
+    finally:
+        hook.remove()
+    assert result["optimizer_steps"] == epochs and result["max_initial_token_log_prob_error"] <= 1e-6
+    assert len(calls) == branches * epochs  # One cached chunk per decision token, per epoch.
+    grpo_update(forced, [deepcopy(group)], make(forced), max_grad_norm=1e9, atol=1e-5,
+                check_post_update=False, update_epochs=epochs)
+    expected, actual = adapter_weights(forced), adapter_weights(replay)
+    for name in expected:
+        assert torch.allclose(actual[name], expected[name], atol=1e-5, rtol=1e-4), name
+    assert not replay.model.training
+
+
+def test_decisions_record_entropies(policy, observation):
+    for deterministic in [False, True]:
+        decision = policy.choose_action(observation, deterministic=deterministic)
+        branches = [c for c in decision["token_choices"] if len(c) > 1]
+        assert len(decision["decision_entropies"]) == len(branches)
+        for entropy, choices in zip(decision["decision_entropies"], branches):
+            assert -1e-6 <= entropy <= math.log(len(choices)) + 1e-6
+
+
 def test_grpo_skips_constant_reward_groups(policy, observation, monkeypatch):
     actor = WikiGamePolicy(model=deepcopy(policy.model), tokenizer=policy.tokenizer)
     actor.enable_lora()
@@ -1043,7 +1169,17 @@ def test_grpo_cli_collects_audits_and_reports_update(policy, tmp_path, monkeypat
         assert row["group_summary"]["total_rollouts"] == 4
         if row["validation"]:
             assert row["validation"]["num_episodes"] == 1
-        assert (output / row["checkpoint"] / "adapter" / "adapter_model.safetensors").exists()
+        kept = row["validation"] is not None or row is report["history"][-1]
+        folder = output / row["checkpoint"]
+        # Superseded, unvalidated checkpoints keep only their route report.
+        assert (folder / "adapter" / "adapter_model.safetensors").exists() == kept
+        assert (folder / "trainer_state.pt").exists() == kept
+        assert (folder / "report.json").exists()
+        decision_entropy = row["update"]["decision_entropy"]
+        assert decision_entropy is None or 0 <= decision_entropy["mean_normalized"] <= 1 + 1e-6
+    from training.checkpoint import resolve_resume
+    assert resolve_resume(output)[1].name == "batch_000002"
+    assert report["settings"]["val_seed"] == 42 and report["settings"]["prune_checkpoints"]
     with pytest.raises(SystemExit):
         run(output, 2)  # Existing run directories cannot be overwritten.
     assert report["history"][0]["validation"] is None

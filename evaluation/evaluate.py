@@ -156,6 +156,8 @@ def main():
     parser.add_argument("--distance", type=int,
                         help="Keep only tasks with this shortest distance, before applying --limit.")
     parser.add_argument("--sample", action="store_true", help="Sample actions instead of greedy decoding.")
+    parser.add_argument("--uncached-greedy", action="store_true",
+                        help="Use the original uncached greedy decoder (reproduces the first baselines).")
     parser.add_argument("--rollouts", type=int, default=1, help="Sampled routes per task (default: 1).")
     parser.add_argument("--seed", type=int, default=42, help="Task selection and rollout seed (default: 42).")
     parser.add_argument("--max-clicks", type=int, default=20,
@@ -203,7 +205,10 @@ def main():
         for task in tasks:
             env.validate_pair(task["start"], task["target"])
 
+        if args.uncached_greedy and args.sample:
+            parser.error("--uncached-greedy applies to greedy evaluation only.")
         policy = WikiGamePolicy(max_input_tokens=4096, adapter_path=args.adapter)
+        policy.cached_greedy = not args.uncached_greedy
         runner = EpisodeRunner(env, policy)
         report = evaluate(
             runner, tasks, deterministic=not args.sample, rollouts=args.rollouts, seed=args.seed,
@@ -219,8 +224,10 @@ def main():
             "action_format": "qwen_tool_call",
             "follow_link_argument": "title",
             "enable_thinking": False,
-            "use_cache": False,
-            "decoder": "forced_token_skip" if not args.sample else "kv_cached_sampling_then_teacher_forced_rescore",
+            "use_cache": not args.uncached_greedy,
+            "decoder": ("kv_cached_sampling_then_teacher_forced_rescore" if args.sample
+                        else "forced_token_skip" if args.uncached_greedy
+                        else "kv_cached_greedy_float32_choices"),
             "system_prompt": policy.system_prompt,
             "observation_template": policy.observation_template,
         })

@@ -4,6 +4,7 @@ import json
 import math
 import platform
 import random
+import shutil
 from importlib.metadata import version
 from pathlib import Path
 from collections import Counter
@@ -52,7 +53,12 @@ def distance_list(value):
 
 
 def sample_batch_tasks(tasks, distances, count, rng=random):
-    """Pick a distance uniformly for each slot, then distinct tasks at that distance.
+    """Balanced batches: every distance gets an equal share, the remainder goes at random.
+
+    With 4 tasks and distances 2, 3 and 4, each batch has one task at every
+    distance plus one at a randomly chosen distance, so each distance still gets
+    one third of training on average, but no batch can skip a distance or be
+    dominated by one. Tasks within a distance are distinct and chosen uniformly.
 
     With one distance this is exactly the original random.sample(tasks, count),
     so runs started before multi-distance training resume identically.
@@ -60,7 +66,9 @@ def sample_batch_tasks(tasks, distances, count, rng=random):
     if len(distances) == 1:
         return rng.sample(tasks, count)
     by_distance = {d: [t for t in tasks if t["shortest_distance"] == d] for d in distances}
-    per_distance = Counter(rng.choice(distances) for _ in range(count))
+    rounds, remainder = divmod(count, len(distances))
+    per_distance = Counter({d: rounds for d in distances})
+    per_distance.update(rng.sample(distances, remainder))
     return [task for d in distances for task in rng.sample(by_distance[d], per_distance[d])]
 
 
@@ -114,6 +122,36 @@ def _error_summary(errors):
             "p95": ordered[min(len(ordered) - 1, int(0.95 * len(ordered)))], "max": ordered[-1],
             "fraction_above_0.01": mean(x > 0.01 for x in ordered),
             "fraction_above_0.1": mean(x > 0.1 for x in ordered)}
+
+
+def _entropy_summary(rows):
+    """Behavior-policy entropy at decision tokens: raw (nats) and normalized by log(#choices)."""
+    raw, normalized = [], []
+    for episode, _, _ in rows:
+        for step in episode["steps"]:
+            branches = [c for c in step["token_choices"] if len(c) > 1]
+            for entropy, choices in zip(step.get("decision_entropies", []), branches):
+                raw.append(entropy)
+                normalized.append(entropy / math.log(len(choices)))
+    if not raw:
+        return None
+    return {"decision_tokens": len(raw), "mean": mean(raw), "mean_normalized": mean(normalized),
+            "fraction_near_deterministic": mean(x < 0.05 for x in raw)}
+
+
+def validation_subset(all_val, config):
+    """Fixed validation pairs for every training seed (val_seed); older runs used the training seed."""
+    seed = config.get("val_seed", config["seed"])
+    return random.Random(seed).sample(all_val, min(config["val_limit"], len(all_val)))
+
+
+def prune_checkpoint(path):
+    """Drop a superseded checkpoint's adapter and trainer state; keep its small route report."""
+    path = Path(path)
+    if (path / "trainer_state.pt").is_file():
+        (path / "trainer_state.pt").unlink()
+    if (path / "adapter").is_dir():
+        shutil.rmtree(path / "adapter")
 
 
 def _step_branch_scores(policy, step):
@@ -227,6 +265,7 @@ def grpo_update(policy, groups, optimizer, clip_range=0.2, max_grad_norm=1.0, at
         "update_epochs": update_epochs, "optimizer_steps": 0, "later_epochs": [],
         "max_sampling_rescore_error": max(
             (step.get("sampling_max_abs_error", 0.0) for e, _, _ in rows for step in e["steps"]), default=0.0),
+        "decision_entropy": _entropy_summary(rows),
         "sampling_rescore_error": _error_summary(
             [x for e, _, _ in rows for step in e["steps"] for x in step.get("sampling_abs_errors", [])]),
         "timings": {"gradient_seconds": 0.0, "post_check_seconds": 0.0},
@@ -334,7 +373,7 @@ DEFAULTS = {
     "tasks_per_batch": 4, "rollouts": 8, "seed": 42, "max_clicks": 20,
     "max_input_tokens": 4096, "learning_rate": 1e-5, "clip_range": 0.2,
     "max_grad_norm": 1.0, "val_limit": 100, "eval_every": 10, "min_advantage_std": 0.1,
-    "update_epochs": 2,
+    "update_epochs": 2, "activation_checkpointing": True, "val_seed": 42,
 }
 
 
@@ -432,6 +471,11 @@ def run_training(runner, optimizer, tasks, val_tasks, output, batches, config, p
         report.update(update=update, validation=validation, batch=batch, timings=row["timings"])
         save_checkpoint(policy, optimizer, output / checkpoint, progress, report)
         write_json(output / "report.json", progress)
+        if config.get("prune_checkpoints", False) and len(progress["history"]) >= 2:
+            previous = progress["history"][-2]
+            # Keep validated checkpoints (evaluation candidates) and the latest one (resume).
+            if previous["validation"] is None:
+                prune_checkpoint(output / previous["checkpoint"])
         print("GRPO update:", json.dumps(update, indent=2), flush=True)
         print("Timings:", json.dumps(row["timings"]), flush=True)
         print(f"Saved checkpoint: {output / checkpoint}", flush=True)
@@ -443,12 +487,15 @@ def main():
     for flag in ["tasks", "val_tasks", "articles"]:
         parser.add_argument("--" + flag.replace("_", "-"), type=Path, help=f"Default: {DEFAULTS[flag]}")
     parser.add_argument("--distance", type=int, nargs="+",
-                        help="Training distances, each chosen with equal probability per task. Default: 2 3 4")
+                        help="Training distances; every batch gets an equal share of each. Default: 2 3 4")
     for flag in ["tasks_per_batch", "rollouts", "seed", "max_clicks",
-                 "max_input_tokens", "val_limit", "eval_every", "update_epochs"]:
+                 "max_input_tokens", "val_limit", "eval_every", "update_epochs", "val_seed"]:
         parser.add_argument("--" + flag.replace("_", "-"), type=int, help=f"Default: {DEFAULTS[flag]}")
     for flag in ["learning_rate", "clip_range", "max_grad_norm", "min_advantage_std"]:
         parser.add_argument("--" + flag.replace("_", "-"), type=float, help=f"Default: {DEFAULTS[flag]}")
+    parser.add_argument("--activation-checkpointing", action=argparse.BooleanOptionalAction,
+                        help="Recompute activations during backward to save memory (default: on). "
+                             "Off is faster with identical results but needs much more GPU memory.")
     parser.add_argument("--batches", type=int, help="Total target batches, including completed ones (new run default: 5).")
     parser.add_argument("--output", type=Path, help="A new run directory; inferred on resume.")
     parser.add_argument("--resume", type=Path, help="Run directory or its latest complete checkpoint.")
@@ -490,6 +537,8 @@ def main():
             raise ValueError("--update-epochs must be at least 1.")
         if batches < 1 or any(config[key] < 1 for key in positive) or config["rollouts"] < 2:
             raise ValueError("Batch counts and budgets must be positive; rollouts must be at least two.")
+        if not 0 <= config.get("val_seed", 0) < 2**32:
+            raise ValueError("--val-seed must be between 0 and 2**32 - 1.")
         if not 0 <= config["seed"] < 2**32 or not 0 < config["clip_range"] < 1:
             raise ValueError("Invalid seed or clipping range.")
         if any(not math.isfinite(config[key]) or config[key] <= 0 for key in ["learning_rate", "max_grad_norm"]):
@@ -505,7 +554,7 @@ def main():
                  if sum(t["shortest_distance"] == d for t in tasks) < config["tasks_per_batch"]]
         if short:
             raise ValueError(f"Fewer than --tasks-per-batch training pairs at distance(s): {short}")
-        val_tasks = random.Random(config["seed"]).sample(all_val, min(config["val_limit"], len(all_val)))
+        val_tasks = validation_subset(all_val, config)
         hashes = {key: file_hash(config[key]) for key in ["tasks", "val_tasks", "articles"]}
         if payload and (hashes != config["data_sha256"] or val_tasks != progress["validation_tasks"]):
             raise ValueError("Training/validation/article data changed since the checkpoint.")
@@ -527,7 +576,12 @@ def main():
             policy.model.eval()
         else:
             policy.enable_lora()
-        policy.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        if config.get("activation_checkpointing", True):
+            policy.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        else:
+            # Without checkpointing the KV cache works in training mode, so training can
+            # replay the exact sampling computation and rollouts skip the rescoring pass.
+            policy.replay_scoring = True
         optimizer = torch.optim.AdamW((p for p in policy.model.parameters() if p.requires_grad),
                                      lr=config["learning_rate"], weight_decay=0.0)
         runtime = {"model": policy.model.name_or_path, "device": str(policy.model.device),
@@ -546,12 +600,17 @@ def main():
             config.update(
                 algorithm="constrained_token_grpo", kl_beta=0.0, advantage_std_correction=0,
                 advantage_epsilon=None, advantage_divisor="max(population_std, min_advantage_std)",
-                distance_sampling="uniform_over_distances_then_uniform_task",
-                rollout_decoder="kv_cached_sampling_then_teacher_forced_rescore",
+                distance_sampling="balanced_equal_share_per_batch_random_remainder",
+                rollout_decoder=("kv_cached_sampling" if policy.replay_scoring
+                                 else "kv_cached_sampling_then_teacher_forced_rescore"),
                 choice_logits="float32_output_layer_over_legal_tokens",
-                training_scorer="one_teacher_forced_pass_per_step",
+                validation_decoder="kv_cached_greedy_float32_choices",
+                prune_checkpoints=True,
+                training_scorer=("replay_of_cached_sampling_computation" if policy.replay_scoring
+                                 else "one_teacher_forced_pass_per_step"),
                 loss_normalization="mean_branch_tokens_per_route_then_mean_all_routes",
-                optimizer_steps_per_batch=config["update_epochs"], gradient_checkpointing="non_reentrant",
+                optimizer_steps_per_batch=config["update_epochs"],
+                gradient_checkpointing="non_reentrant" if config["activation_checkpointing"] else "off",
                 post_update_checks="validation_batches", data_sha256=hashes, runtime=runtime,
                 training_metrics_phase="before_optimizer_step", validation_metrics_phase="after_optimizer_step",
                 system_prompt=policy.system_prompt, observation_template=policy.observation_template,

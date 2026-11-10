@@ -10,7 +10,7 @@ from collections import Counter
 
 from training import grpo
 from training.grpo import (clipped_token_loss, distance_list, group_advantages,
-                           sample_batch_tasks)
+                           prune_checkpoint, sample_batch_tasks, validation_subset)
 
 
 def test_group_advantages_use_population_std_and_handle_constant_rewards():
@@ -99,6 +99,20 @@ def test_multi_distance_sampling_is_uniform_over_distances():
         sample_batch_tasks(tasks, [2, 3, 4], 4, random.Random(5))
 
 
+@pytest.mark.parametrize("count, distances", [(4, [2, 3, 4]), (6, [2, 3, 4]), (5, [2, 3]), (2, [2, 3, 4])])
+def test_batches_are_balanced_across_distances(count, distances):
+    tasks = _tasks({2: 20, 3: 20, 4: 20})
+    rng = random.Random(1)
+    for _ in range(500):
+        batch = sample_batch_tasks(tasks, distances, count, rng)
+        per = Counter(t["shortest_distance"] for t in batch)
+        assert len(batch) == count and set(per) <= set(distances)
+        assert len({(t["start"], t["target"]) for t in batch}) == count
+        if count >= len(distances):
+            assert set(per) == set(distances)  # No batch skips a distance.
+        assert max(per.values()) - min(per[d] for d in distances if count >= len(distances) or d in per) <= 1
+
+
 def test_cli_rejects_distance_without_enough_tasks(tmp_path, monkeypatch, capsys):
     train, val = tmp_path / "train.json", tmp_path / "val.json"
     train.write_text(json.dumps(_tasks({2: 10, 3: 10, 4: 2})), encoding="utf-8")
@@ -115,5 +129,45 @@ def test_defaults_match_final_training_setup():
     assert grpo.DEFAULTS["rollouts"] == 8 and grpo.DEFAULTS["tasks_per_batch"] == 4
     assert grpo.DEFAULTS["min_advantage_std"] == 0.1
     assert grpo.DEFAULTS["update_epochs"] == 2
+    assert grpo.DEFAULTS["activation_checkpointing"] is True
     assert grpo.DEFAULTS["val_limit"] == 100 and grpo.DEFAULTS["eval_every"] == 10
     assert "final_v2_5000" in grpo.DEFAULTS["tasks"] and "final_v2_5000" in grpo.DEFAULTS["val_tasks"]
+
+
+def test_checkpointing_switch_parses(tmp_path, monkeypatch, capsys):
+    # Reaches the distance check (before any model loading), so the flag must parse.
+    train, val = tmp_path / "train.json", tmp_path / "val.json"
+    train.write_text(json.dumps(_tasks({2: 1})), encoding="utf-8")
+    val.write_text(json.dumps([{"start": "v", "target": "w", "shortest_distance": 2}]), encoding="utf-8")
+    for flag in ["--no-activation-checkpointing", "--activation-checkpointing"]:
+        monkeypatch.setattr(sys, "argv", ["grpo", "--tasks", str(train), "--val-tasks", str(val), flag,
+                                          "--distance", "2", "--output", str(tmp_path / "run")])
+        with pytest.raises(SystemExit):
+            grpo.main()
+        assert "distance(s): [2]" in capsys.readouterr().err
+
+
+def test_validation_pairs_do_not_depend_on_training_seed():
+    pairs = _tasks({2: 50, 3: 50, 4: 50})
+    subsets = [validation_subset(pairs, {"seed": seed, "val_seed": 42, "val_limit": 100}) for seed in [42, 43, 44]]
+    assert subsets[0] == subsets[1] == subsets[2]
+    # This is exactly what evaluate.py --limit 100 --seed 42 selects for the base model.
+    assert subsets[0] == random.Random(42).sample(pairs, 100)
+    # Runs started before val_seed existed keep using their training seed.
+    assert validation_subset(pairs, {"seed": 43, "val_limit": 100}) == random.Random(43).sample(pairs, 100)
+
+
+def test_prune_checkpoint_keeps_route_report(tmp_path):
+    from training.checkpoint import resolve_resume
+    run = tmp_path / "run"
+    for batch in [1, 2]:
+        folder = run / "checkpoints" / f"batch_{batch:06d}"
+        (folder / "adapter").mkdir(parents=True)
+        (folder / "adapter" / "adapter_model.safetensors").write_bytes(b"x")
+        (folder / "trainer_state.pt").write_bytes(b"x")
+        (folder / "report.json").write_text("{}")
+    prune_checkpoint(run / "checkpoints" / "batch_000001")
+    first = run / "checkpoints" / "batch_000001"
+    assert not (first / "adapter").exists() and not (first / "trainer_state.pt").exists()
+    assert (first / "report.json").exists()
+    assert resolve_resume(run)[1].name == "batch_000002"

@@ -19,6 +19,12 @@ class WikiGamePolicy:
         self.system_prompt = SYSTEM_PROMPT
         self.observation_template = OBSERVATION_TEMPLATE
         self.max_input_tokens = max_input_tokens
+        # When True, training scores a sampled call by replaying the exact cached
+        # computation it was sampled with (needs activation checkpointing off).
+        self.replay_scoring = False
+        # Greedy decisions use the KV-cached path by default; False restores the
+        # original uncached per-prefix decoder (used for the first baselines).
+        self.cached_greedy = True
         device = "cuda" if torch.cuda.is_available() else "cpu"
         dtype = "auto"
         if device == "cuda":
@@ -198,15 +204,17 @@ class WikiGamePolicy:
             logits = logits + head.bias[choices].float()
         return torch.log_softmax(logits, dim=-1)
 
-    def _sample_cached(self, prompt_ids, sequences):
-        """Sample one legal call, reusing a KV cache between branching points.
+    def _sample_cached(self, prompt_ids, sequences, greedy=False):
+        """Choose one legal call, reusing a KV cache between branching points.
 
         The prompt is encoded once; each later forward pass only covers the tokens
         appended since the previous branch. Forced tokens need no forward pass of
-        their own. Returns the tokens, their legal-token masks, and the log
-        probabilities the draws were made from.
+        their own. greedy=True takes the most likely legal token at each decision
+        instead of sampling. Returns the tokens, their legal-token masks, and the
+        log probabilities the choices were made from.
         """
         tokens, token_choices, sampled = [], [], []
+        self._last_entropies = []
         cache, pending = None, list(prompt_ids)
         for _ in range(max(map(len, sequences.values()))):
             choices = self._allowed_tokens(sequences, tokens)
@@ -218,7 +226,9 @@ class WikiGamePolicy:
                 hidden, cache = self._hidden(pending, past_key_values=cache, use_cache=True)
                 pending = []
                 log_probs = self._choice_log_probs(hidden[-1], choices)
-                index = torch.multinomial(log_probs.exp(), num_samples=1).item()
+                self._last_entropies.append(-(log_probs.exp() * log_probs).sum().item())
+                index = (log_probs.argmax().item() if greedy
+                         else torch.multinomial(log_probs.exp(), num_samples=1).item())
                 token, score = choices[index], log_probs[index].item()
             tokens.append(token)
             token_choices.append(choices)
@@ -228,12 +238,44 @@ class WikiGamePolicy:
                 break
         return tokens, token_choices, sampled
 
+    def _replay_log_probs(self, prompt_ids, token_ids, token_choices):
+        """Score a sampled call with exactly the cached computation it was drawn from.
+
+        _sample_cached feeds the prompt plus forced tokens up to the first decision,
+        then, for each later decision, the previous chosen token plus forced tokens
+        since, reusing the KV cache. Replaying the same chunks reproduces the
+        sampling probabilities exactly, so no separate rescoring pass is needed.
+        """
+        self._check_recorded(prompt_ids, token_ids, token_choices)
+        body, _ = self._decoder()
+        if torch.is_grad_enabled() and self.model.training and getattr(body, "gradient_checkpointing", False):
+            raise ValueError("Replay scoring needs activation checkpointing off (it disables the KV cache).")
+        zero = torch.zeros((), device=self.model.device, requires_grad=torch.is_grad_enabled())
+        scores = [zero] * len(token_ids)
+        cache, start, pending = None, 0, list(prompt_ids)
+        for i, choices in enumerate(token_choices):
+            if len(choices) == 1:
+                continue
+            hidden, cache = self._hidden(pending + token_ids[start:i], past_key_values=cache, use_cache=True)
+            scores[i] = self._choice_log_probs(hidden[-1], choices)[choices.index(token_ids[i])]
+            pending, start = [], i
+        return torch.stack(scores)
+
+    def _check_recorded(self, prompt_ids, token_ids, token_choices):
+        if not prompt_ids or not token_ids or len(token_ids) != len(token_choices):
+            raise ValueError("Provide a prompt and matching token/mask sequences.")
+        for token, choices in zip(token_ids, token_choices):
+            if not choices or len(choices) != len(set(choices)) or token not in choices:
+                raise ValueError("Each recorded token must have a valid legal-token mask.")
+
     @torch.no_grad()
     def choose_action(self, observation, deterministic=False):
         """Choose one legal call; forced syntax never needs a forward pass.
 
-        Greedy decisions (evaluation) query the model uncached at each branching
-        prefix, exactly as the baselines were produced.
+        Greedy decisions (evaluation) use the same KV-cached path with argmax and
+        record the probabilities they were chosen from. With cached_greedy=False
+        they instead query the model uncached at each branching prefix, the
+        decoder the first baselines were produced with.
 
         Sampled decisions (training rollouts) draw with a KV cache, then record
         token log probabilities from one teacher-forced pass over the chosen call:
@@ -248,12 +290,14 @@ class WikiGamePolicy:
         sequences = self._action_sequences(calls)
         inputs = self._prepare_inputs(observation, max(map(len, sequences.values())))
         prompt_ids = inputs["input_ids"][0].tolist()
-        if not deterministic:
-            tokens, token_choices, sampled = self._sample_cached(prompt_ids, sequences)
+        if not deterministic or self.cached_greedy:
+            tokens, token_choices, sampled = self._sample_cached(prompt_ids, sequences, greedy=deterministic)
             action = next((a for a, sequence in sequences.items() if sequence == tokens), None)
             if action is None:
                 raise RuntimeError("Generation did not produce a complete legal tool call.")
-            if any(len(choices) > 1 for choices in token_choices):
+            if deterministic or self.replay_scoring:
+                scores = sampled  # Greedy decisions are not trained on; replay reproduces these exactly.
+            elif any(len(choices) > 1 for choices in token_choices):
                 scores = self._step_log_probs(prompt_ids, tokens, token_choices).tolist()
             else:
                 scores = [0.0] * len(tokens)
@@ -265,6 +309,8 @@ class WikiGamePolicy:
                 "log_prob": torch.tensor(scores, device=self.model.device, dtype=torch.float32).sum().item(),
                 "sampling_abs_errors": errors,
                 "sampling_max_abs_error": max(errors, default=0.0),
+                # Entropy of each decision's legal-token distribution, in nats.
+                "decision_entropies": self._last_entropies,
             }
         tokens, token_choices, scores = [], [], []
         for _ in range(max(map(len, sequences.values()))):
@@ -301,11 +347,7 @@ class WikiGamePolicy:
         hidden states at the final len(token_ids) positions predict each recorded
         token, scored over its legal tokens in float32. Forced tokens contribute zero.
         """
-        if not prompt_ids or not token_ids or len(token_ids) != len(token_choices):
-            raise ValueError("Provide a prompt and matching token/mask sequences.")
-        for token, choices in zip(token_ids, token_choices):
-            if not choices or len(choices) != len(set(choices)) or token not in choices:
-                raise ValueError("Each recorded token must have a valid legal-token mask.")
+        self._check_recorded(prompt_ids, token_ids, token_choices)
         zero = torch.zeros((), device=self.model.device, requires_grad=torch.is_grad_enabled())
         branches = [i for i, choices in enumerate(token_choices) if len(choices) > 1]
         if not branches:
@@ -321,10 +363,13 @@ class WikiGamePolicy:
     def get_token_log_probs(self, prompt_ids, token_ids, token_choices):
         """Score recorded tokens with gradients, using their exact input and masks.
 
-        One teacher-forced forward pass per call; this is the calculation training
-        uses. Forced tokens contribute zero. Training controls model mode; keep
-        dropout disabled when comparing rollout and training probabilities.
+        With replay_scoring, this replays the cached sampling computation exactly;
+        otherwise it is one teacher-forced pass per call, which sampled decisions
+        then record. Forced tokens contribute zero. Training controls model mode;
+        keep dropout disabled when comparing rollout and training probabilities.
         """
+        if self.replay_scoring:
+            return self._replay_log_probs(prompt_ids, token_ids, token_choices)
         return self._step_log_probs(prompt_ids, token_ids, token_choices)
 
     def iter_token_log_probs(self, prompt_ids, token_ids, token_choices):
