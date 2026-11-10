@@ -10,7 +10,7 @@ import transformers
 from transformers import GenerationConfig
 
 from environment.environment import WikiGameEnv
-from evaluation.audit_saved_routes import analyze_routes
+from evaluation.audit_saved_routes import analyze_routes, link_index
 from policy.llm_policy import WikiGamePolicy
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,7 +33,11 @@ def replay_states(report, env, count):
                     "start": episode["start"], "target": episode["target"], "step": step,
                     "observation": env.get_llm_observation(),
                 })
-            action = env.back_action if call["name"] == "go_back" else call["arguments"]["link_id"]
+            if call["name"] == "go_back":
+                action = env.back_action
+            else:
+                outgoing = env.articles[env.current]["outgoing"]
+                action = link_index(call["arguments"], outgoing, env.articles)
             env.step(action)
             position += 1
     return selected

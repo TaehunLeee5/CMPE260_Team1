@@ -21,19 +21,19 @@ class TargetPolicy:
         self.deterministic_calls.append(deterministic)
         for action in observation["actions"]:
             if action["title"] == observation["target_title"]:
-                return self.follow(action["id"])
+                return self.follow(action)
         if observation["actions"]:
-            return self.follow(observation["actions"][0]["id"])
+            return self.follow(observation["actions"][0])
         return {
             "action": observation["back_action_id"],
             "tool_call": {"name": "go_back", "arguments": {}}, "log_prob": 0.0,
         }
 
     @staticmethod
-    def follow(link_id):
+    def follow(action):
         return {
-            "action": link_id,
-            "tool_call": {"name": "follow_link", "arguments": {"link_id": link_id}},
+            "action": action["id"],
+            "tool_call": {"name": "follow_link", "arguments": {"title": action["title"]}},
             "log_prob": 0.0,
         }
 
@@ -94,7 +94,8 @@ def test_run_episode(runner, deterministic):
         assert observation["target_title"] == "France"
         assert observation["remaining_clicks"] == runner.env.max_clicks - index
         assert current["outgoing"][step["action"]] == episode["path"][index + 1]
-        assert step["tool_call"] == {"name": "follow_link", "arguments": {"link_id": step["action"]}}
+        destination = runner.env.articles[current["outgoing"][step["action"]]]["title"]
+        assert step["tool_call"] == {"name": "follow_link", "arguments": {"title": destination}}
         assert isinstance(step["log_prob"], float)
         assert math.isfinite(step["log_prob"]) and step["log_prob"] <= 0
         assert step["log_prob"] == 0.0
@@ -153,7 +154,7 @@ def test_evaluation_keeps_compact_tool_trace(runner):
     report = evaluate(runner, [{"start": "Europe", "target": "France", "shortest_distance": 1}])
     episode = report["episodes"][0]
     assert report["summary"]["successes"] == 1
-    assert episode["tool_calls"] == [{"name": "follow_link", "arguments": {"link_id": 1}}]
+    assert episode["tool_calls"] == [{"name": "follow_link", "arguments": {"title": "France"}}]
     assert episode["navigation_stack"] == ["Europe", "France"]
     assert episode["action_log_probs"] == [0.0]
     assert report["settings"]["deterministic"] is True
@@ -168,8 +169,8 @@ class SamplePolicy(TargetPolicy):
     def choose_action(self, observation, deterministic=False):
         self.deterministic_calls.append(deterministic)
         if observation["current_title"] == "Loop":
-            return self.follow(0)
-        options = [self.follow(action["id"]) for action in observation["actions"]]
+            return self.follow(observation["actions"][0])
+        options = [self.follow(action) for action in observation["actions"]]
         if observation["back_available"]:
             options.append({
                 "action": observation["back_action_id"],
@@ -255,8 +256,8 @@ def test_route_diversity_is_separate_from_reward_variation():
     rows = [{
         "task_index": 1, "start": "A", "target": "T", "shortest_distance": 2,
         "episode_return": 0.0, "success": False, "path": path,
-        "tool_calls": [{"name": "follow_link", "arguments": {"link_id": link}}],
-    } for path, link in [(["A", "B"], 0), (["A", "C"], 1)]]
+        "tool_calls": [{"name": "follow_link", "arguments": {"title": link}}],
+    } for path, link in [(["A", "B"], "B"), (["A", "C"], "C")]]
     groups, summary = summarize_groups(rows)
     assert groups[0]["unique_routes"] == groups[0]["unique_tool_sequences"] == 2
     assert groups[0]["return_std"] == 0

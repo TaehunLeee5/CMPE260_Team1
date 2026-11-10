@@ -63,7 +63,7 @@ def observation():
     }
 
 
-def assert_decision(policy, observation, decision, atol=1e-5):
+def assert_decision(policy, observation, decision, atol=1e-5, reference=False, replay=False):
     calls = policy._tool_calls(observation)
     assert decision["tool_call"] == calls[decision["action"]]
     assert json.loads(json.dumps(decision)) == decision
@@ -73,9 +73,16 @@ def assert_decision(policy, observation, decision, atol=1e-5):
     assert raw.startswith("<tool_call>\n") and raw.endswith("\n</tool_call>")
     assert json.loads(raw[len("<tool_call>\n"):-len("\n</tool_call>")]) == decision["tool_call"]
     with torch.enable_grad():
-        rescored = policy.get_token_log_probs(
-            decision["prompt_ids"], tokens, decision["token_choices"],
-        )
+        if reference:
+            rescored = torch.stack(list(policy.iter_token_log_probs(
+                decision["prompt_ids"], tokens, decision["token_choices"],
+            )))
+        elif replay:
+            rescored = policy._replay_log_probs(decision["prompt_ids"], tokens, decision["token_choices"])
+        else:
+            rescored = policy.get_token_log_probs(
+                decision["prompt_ids"], tokens, decision["token_choices"],
+            )
     expected = torch.tensor(decision["token_log_probs"], device=rescored.device)
     assert rescored.requires_grad
     assert torch.allclose(rescored.detach(), expected, atol=atol, rtol=0)
@@ -91,10 +98,12 @@ def test_prompt_and_tool_definitions(policy, observation):
     original = deepcopy(observation)
     inputs = policy._prepare_inputs(observation, 80)
     prompt = policy.tokenizer.decode(inputs["input_ids"][0])
-    for text in ["follow_link", "go_back", "link_id", "Target article: France",
-                 "Back: Earth", "Navigation stack: Earth -> Europe", "<think>\n\n</think>"]:
+    for text in ["follow_link", "go_back", '"required": ["title"]', "Target article: France",
+                 "Back: Earth", "Navigation stack: Earth -> Europe", "<think>\n\n</think>",
+                 "Available links:\n- France\n- Germany\n- Italy\n- Spain\n"]:
         assert text in prompt
-    assert "back_action_id" not in prompt
+    assert "back_action_id" not in prompt and "link_id" not in prompt
+    assert "100: France" not in prompt  # Internal environment action IDs stay hidden.
     assert observation == original
     observation.update(back_available=False, back_action_id=None, back_destination=None)
     prompt = policy.tokenizer.decode(policy._prepare_inputs(observation, 80)["input_ids"][0])
@@ -103,10 +112,21 @@ def test_prompt_and_tool_definitions(policy, observation):
     assert set(policy._tool_calls(observation)) == {0, 2, 10, 100}
 
 
-@pytest.mark.parametrize("count", [1, 2, 9, 10, 11, 99, 100, 101, 294])
-def test_all_calls_are_reachable(policy, observation, count):
-    observation["actions"] = [{"id": i, "title": str(i)} for i in range(count)]
+SHARED_PREFIX_TITLES = [
+    "United", "United States", "United Kingdom", "United Nations", "Union",
+    'Quote "Marks"', "Back\\slash", "Rock (music)", "Rock and roll", "Ro",
+]
+
+
+@pytest.mark.parametrize("titles", [
+    *[[str(i) for i in range(count)] for count in [1, 2, 9, 10, 11, 99, 100, 101, 294]],
+    SHARED_PREFIX_TITLES,
+])
+def test_all_calls_are_reachable(policy, observation, titles):
+    count = len(titles)
+    observation["actions"] = [{"id": i, "title": title} for i, title in enumerate(titles)]
     calls = policy._tool_calls(observation)
+    assert {call["arguments"]["title"] for call in calls.values() if call["arguments"]} == set(titles)
     sequences = policy._action_sequences(calls)
     assert len({tuple(s) for s in sequences.values()}) == count + 1
     for action, tokens in sequences.items():
@@ -115,6 +135,46 @@ def test_all_calls_are_reachable(policy, observation, count):
         assert not policy._allowed_tokens(sequences, tokens)
         text = policy.tokenizer.decode(tokens[:-1])
         assert json.loads(text[len("<tool_call>\n"):-len("\n</tool_call>")]) == calls[action]
+
+
+def test_links_sorted_by_title_and_visited_links_tagged(policy, observation):
+    observation["history"] = ["Earth", "Spain", "Earth", "Europe"]
+    observation["actions"] = [{"id": i, "title": title} for i, title in enumerate([
+        "Zebra", "apple", "Åland Islands", "Abel Tasman", "Spain", "Europe", "Éire", "Earth",
+    ])]
+    original = deepcopy(observation)
+    prompt = policy.build_prompt(observation)
+    assert prompt.split("Available links:\n")[1].split("\n\n")[0].splitlines() == [
+        "- Abel Tasman", "- Åland Islands", "- apple", "- Earth (visited)", "- Éire",
+        "- Europe (current page)", "- Spain (visited)", "- Zebra",
+    ]
+    assert observation == original  # Display order only; environment action IDs are unchanged.
+    calls = policy._tool_calls(observation)
+    assert calls[1] == {"name": "follow_link", "arguments": {"title": "apple"}}
+    assert calls[5] == {"name": "follow_link", "arguments": {"title": "Europe"}}
+
+
+def test_tags_are_never_generated(policy, observation):
+    observation["actions"].append({"id": 5, "title": "Earth"})
+    sequences = policy._action_sequences(policy._tool_calls(observation))
+    for tokens in sequences.values():
+        assert "(visited)" not in policy.tokenizer.decode(tokens)
+        assert "(current page)" not in policy.tokenizer.decode(tokens)
+    assert "- Earth (visited)" in policy.build_prompt(observation)
+
+
+def test_tool_calls_use_titles_and_keep_unicode(policy, observation, monkeypatch):
+    calls = policy._tool_calls(observation)
+    assert calls[100] == {"name": "follow_link", "arguments": {"title": "France"}}
+    assert calls[300] == {"name": "go_back", "arguments": {}}
+    observation["actions"] = [{"id": 4, "title": "Côte d'Ivoire"}, {"id": 9, "title": "Zürich"}]
+    encoded = []
+    encode = policy.tokenizer.encode
+    monkeypatch.setattr(policy.tokenizer, "encode", lambda text, **kwargs: encoded.append(text) or encode(text, **kwargs))
+    policy._action_sequences(policy._tool_calls(observation))
+    assert '<tool_call>\n{"name": "follow_link", "arguments": {"title": "Côte d\'Ivoire"}}\n</tool_call>' in encoded
+    assert any("Zürich" in text for text in encoded)
+    assert not any("\\u" in text for text in encoded)
 
 
 @pytest.mark.parametrize("deterministic", [False, True])
@@ -159,8 +219,7 @@ def test_single_legal_call_has_probability_one(policy, observation, back_only):
         observation.update(back_available=False, back_action_id=None, back_destination=None)
         observation["actions"] = [{"id": 100, "title": "France"}]
         expected = 100
-    forwards = []
-    hook = policy.model.register_forward_pre_hook(lambda module, inputs: forwards.append(1))
+    forwards, hook = count_forwards(policy.model)
     try:
         decision = policy.choose_action(observation)
     finally:
@@ -198,7 +257,7 @@ def test_text_truncation_preserves_state_and_links(policy, observation, monkeypa
     prompt = policy.tokenizer.decode(inputs["input_ids"][0])
     assert inputs["input_ids"].shape[1] <= limit
     for action in observation["actions"]:
-        assert f"{action['id']}: {action['title']}" in prompt
+        assert f"- {action['title']}" in prompt
     assert "Back: Earth" in prompt and "Visited route: Earth -> Europe" in prompt
     assert observation == original
     monkeypatch.setattr(policy, "max_input_tokens", 1)
@@ -213,6 +272,12 @@ def test_invalid_actions_and_records_rejected(policy, observation):
         policy.get_token_log_probs([1], [1], [[2]])
     observation["actions"].append(observation["actions"][0])
     with pytest.raises(ValueError, match="unique"):
+        policy.choose_action(observation)
+    observation["actions"][-1] = {"id": 7, "title": "Germany"}  # Same title, new ID.
+    with pytest.raises(ValueError, match="titles must be unique"):
+        policy.choose_action(observation)
+    observation["actions"][-1] = {"id": 7, "title": "  "}
+    with pytest.raises(ValueError, match="titles must be unique nonempty"):
         policy.choose_action(observation)
     observation["actions"] = []
     observation["back_available"] = False
@@ -251,8 +316,36 @@ def real_policy():
 @pytest.mark.parametrize("deterministic", [False, True])
 def test_pretrained_rollout_and_training_match(real_policy, observation, deterministic):
     decision = real_policy.choose_action(observation, deterministic)
-    assert_decision(real_policy, observation, decision, atol=1e-4)
+    # Greedy decisions record their cached computation (replayed exactly); sampled
+    # decisions record the teacher-forced training scorer.
+    assert_decision(real_policy, observation, decision, atol=1e-4, replay=deterministic)
     print("Tool:", decision["tool_call"], "log probability:", decision["log_prob"])
+    if not deterministic:
+        # Cached draw probabilities versus the recorded teacher-forced ones (bf16 rounding).
+        print("Sampling vs recorded abs errors:", decision["sampling_abs_errors"])
+        assert decision["sampling_max_abs_error"] < 0.05
+
+
+@pytest.mark.integration
+def test_pretrained_replay_is_exact(real_policy, observation):
+    real_policy.replay_scoring = True
+    try:
+        for long_context in [False, True]:
+            if long_context:
+                observation["text"] = "Article context. " * 2000
+            decision = real_policy.choose_action(observation, deterministic=False)
+            real_policy.model.train()
+            try:
+                with torch.enable_grad():
+                    replayed = real_policy.get_token_log_probs(
+                        decision["prompt_ids"], decision["token_ids"], decision["token_choices"])
+            finally:
+                real_policy.model.eval()
+            error = (replayed.detach().cpu() - torch.tensor(decision["token_log_probs"])).abs().max().item()
+            print("Replay vs sampling max abs error:", error, "long context:", long_context)
+            assert error <= 1e-4
+    finally:
+        real_policy.replay_scoring = False
 
 
 @pytest.mark.integration
@@ -290,16 +383,109 @@ def force_action(policy, observation, action, monkeypatch):
     monkeypatch.setattr(torch, "multinomial", draw)
 
 
-def test_forward_passes_only_at_branching_prefixes(policy, observation):
-    forwards = []
-    hook = policy.model.register_forward_pre_hook(lambda module, inputs: forwards.append(1))
+@pytest.mark.parametrize("cached", [True, False])
+def test_forward_passes_only_at_branching_prefixes(policy, observation, cached):
+    policy.cached_greedy = cached
     try:
-        decision = policy.choose_action(observation, deterministic=True)
+        forwards, hook = count_forwards(policy.model)
+        try:
+            decision = policy.choose_action(observation, deterministic=True)
+        finally:
+            hook.remove()
     finally:
-        hook.remove()
+        policy.cached_greedy = True
     decisions = sum(len(choices) > 1 for choices in decision["token_choices"])
     assert len(forwards) == decisions
     assert decisions < len(decision["token_ids"])
+
+
+def test_cached_and_uncached_greedy_agree(policy, observation):
+    cached = policy.choose_action(observation, deterministic=True)
+    policy.cached_greedy = False
+    try:
+        uncached = policy.choose_action(observation, deterministic=True)
+    finally:
+        policy.cached_greedy = True
+    assert cached["token_ids"] == uncached["token_ids"] and cached["action"] == uncached["action"]
+    assert cached["token_log_probs"] == pytest.approx(uncached["token_log_probs"], abs=1e-5)
+    # Greedy decisions record the probabilities they were chosen from.
+    with torch.no_grad():
+        replayed = policy._replay_log_probs(cached["prompt_ids"], cached["token_ids"], cached["token_choices"])
+    assert replayed.tolist() == pytest.approx(cached["token_log_probs"], abs=1e-6)
+
+
+def count_forwards(model):
+    """Count transformer passes; the scorers call the body directly, below any wrapper."""
+    body = model.get_base_model().model if isinstance(model, PeftModel) else model.model
+    calls = []
+    return calls, body.register_forward_pre_hook(lambda module, inputs: calls.append(1))
+
+
+def test_sampled_decision_uses_cache_then_one_rescore(policy, observation):
+    calls, hook = count_forwards(policy.model)
+    try:
+        decision = policy.choose_action(observation, deterministic=False)
+    finally:
+        hook.remove()
+    decisions = sum(len(choices) > 1 for choices in decision["token_choices"])
+    assert decisions > 0
+    assert len(calls) == decisions + 1  # One cached pass per branch, plus the recording pass.
+    assert decision["sampling_max_abs_error"] < 1e-5
+    assert_decision(policy, observation, decision)
+
+
+def test_sampled_records_exactly_what_training_scores(policy, observation):
+    decision = policy.choose_action(observation, deterministic=False)
+    with torch.enable_grad():
+        current = policy.get_token_log_probs(
+            decision["prompt_ids"], decision["token_ids"], decision["token_choices"])
+    assert current.detach().tolist() == pytest.approx(decision["token_log_probs"], abs=1e-6)
+
+
+def test_cached_draws_match_reference_prefix_probabilities(policy, observation, monkeypatch):
+    """The cached distribution at each branch equals the uncached per-prefix one."""
+    seen = []
+    real_multinomial = torch.multinomial
+
+    def record(probabilities, num_samples=1, **kwargs):
+        seen.append(probabilities.clone())
+        return real_multinomial(probabilities, num_samples, **kwargs)
+
+    monkeypatch.setattr(torch, "multinomial", record)
+    decision = policy.choose_action(observation, deterministic=False)
+    branches = [i for i, choices in enumerate(decision["token_choices"]) if len(choices) > 1]
+    assert len(seen) == len(branches)
+    with torch.no_grad():
+        for probabilities, i in zip(seen, branches):
+            reference = policy._next_log_probs(
+                decision["prompt_ids"], decision["token_ids"][:i], decision["token_choices"][i]).exp()
+            assert torch.allclose(probabilities, reference, atol=1e-6)
+
+
+def test_training_scores_a_step_in_one_forward_pass(policy, observation):
+    decision = policy.choose_action(observation, deterministic=True)
+    assert sum(len(choices) > 1 for choices in decision["token_choices"]) > 1
+    calls, hook = count_forwards(policy.model)
+    try:
+        with torch.enable_grad():
+            scores = policy.get_token_log_probs(
+                decision["prompt_ids"], decision["token_ids"], decision["token_choices"])
+    finally:
+        hook.remove()
+    assert len(calls) == 1 and scores.requires_grad
+    reference = torch.stack(list(policy.iter_token_log_probs(
+        decision["prompt_ids"], decision["token_ids"], decision["token_choices"])))
+    assert torch.allclose(scores.detach(), reference.detach(), atol=1e-5)
+
+
+def test_cached_sampling_with_lora_and_checkpointing(policy, observation):
+    actor = WikiGamePolicy(model=deepcopy(policy.model), tokenizer=policy.tokenizer)
+    actor.enable_lora()
+    actor.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    for action in [0, 100, 300]:
+        decision = actor.choose_action(observation, deterministic=False)
+        assert_decision(actor, observation, decision)
+    assert not actor.model.training
 
 
 def test_standard_uncached_reference_agrees(policy, observation):
@@ -402,7 +588,7 @@ def test_goal_probe_reports_probability_changes_without_argmax_change(policy, ob
 
     def choose(variant, deterministic=False):
         return {
-            "action": 0, "tool_call": {"name": "follow_link", "arguments": {"link_id": 0}},
+            "action": 0, "tool_call": {"name": "follow_link", "arguments": {"title": "Germany"}},
             "log_prob": math.log(probability(variant, 0)), "prompt_ids": [1],
         }
 
@@ -437,7 +623,7 @@ def test_article_first_layout_changes_order_only(policy, observation, monkeypatc
     candidate = policy.build_prompt(observation)
     assert current.index("Target article:") < current.index("Current article text:")
     assert candidate.index("Current article text:") < candidate.index("Target article:") < candidate.index("Available links:")
-    for value in [observation["text"], observation["target_title"], "0: Germany", "100: France", "Earth -> Europe"]:
+    for value in [observation["text"], observation["target_title"], "- Germany", "- France", "Earth -> Europe"]:
         assert value in current and value in candidate
     assert_decision(policy, observation, policy.choose_action(observation, deterministic=True))
 
@@ -680,6 +866,229 @@ def test_streamed_grpo_matches_full_graph_update(policy, observation, monkeypatc
     assert json.loads(json.dumps(result, allow_nan=False)) == result
 
 
+@pytest.mark.parametrize("check_post_update", [False, True])
+def test_grpo_update_uses_one_forward_pass_per_step(policy, observation, monkeypatch, check_post_update):
+    actor = WikiGamePolicy(model=deepcopy(policy.model), tokenizer=policy.tokenizer)
+    actor.enable_lora()
+    actor.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    group = controlled_grpo_group(actor, observation, monkeypatch)
+    group[0]["steps"].append(deepcopy(group[0]["steps"][0]))  # A two-step route.
+    steps = sum(any(len(c) > 1 for c in step["token_choices"]) for e in group for step in e["steps"])
+    tokens = sum(len(c) > 1 for e in group for step in e["steps"] for c in step["token_choices"])
+    assert tokens > steps  # Several decision tokens per step, so per-token scoring would differ.
+    optimizer = torch.optim.AdamW((p for p in actor.model.parameters() if p.requires_grad), lr=1e-3)
+    calls, hook = count_forwards(actor.model)
+    try:
+        result = grpo_update(actor, [group], optimizer, max_grad_norm=1e9, atol=1e-5,
+                             check_post_update=check_post_update)
+    finally:
+        hook.remove()
+    assert result["optimizer_step_applied"] and result["active_branch_tokens"] == tokens
+    assert len(calls) == steps * (2 if check_post_update else 1)
+    assert result["max_sampling_rescore_error"] < 1e-5
+
+
+def lora_actor(policy):
+    actor = WikiGamePolicy(model=deepcopy(policy.model), tokenizer=policy.tokenizer)
+    actor.enable_lora()
+    actor.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    return actor
+
+
+def adapter_weights(actor):
+    return {n: p.detach().clone() for n, p in actor.model.named_parameters() if p.requires_grad}
+
+
+def test_second_epoch_equals_a_manual_clipped_step(policy, observation, monkeypatch):
+    first = lora_actor(policy)
+    group = controlled_grpo_group(first, observation, monkeypatch)
+    second = WikiGamePolicy(model=deepcopy(first.model), tokenizer=policy.tokenizer)
+    make = lambda actor: torch.optim.AdamW(
+        (p for p in actor.model.parameters() if p.requires_grad), lr=0.05, weight_decay=0)
+
+    optimizer = make(first)
+    result = grpo_update(first, [group], optimizer, max_grad_norm=1e9, atol=1e-5,
+                         check_post_update=False, update_epochs=2)
+    assert result["optimizer_steps"] == 2 and len(result["later_epochs"]) == 1
+
+    # Reference: one epoch through grpo_update, then the second step written out by hand.
+    reference_optimizer = make(second)
+    grpo_update(second, [group], reference_optimizer, max_grad_norm=1e9, atol=1e-5,
+                check_post_update=False, update_epochs=1)
+    second.model.train()
+    advantages = group_advantages([e["episode_return"] for e in group])
+    loss = 0
+    for episode, advantage in zip(group, advantages):
+        step = episode["steps"][0]
+        mask = torch.tensor([len(c) > 1 for c in step["token_choices"]])
+        current = second.get_token_log_probs(step["prompt_ids"], step["token_ids"], step["token_choices"])
+        old = torch.tensor(step["token_log_probs"])
+        loss = loss + clipped_token_loss(current[mask], old[mask], advantage).sum() / (int(mask.sum()) * len(group))
+    loss.backward()
+    reference_optimizer.step()
+    second.model.eval()
+    assert result["later_epochs"][0]["loss"] == pytest.approx(loss.item(), abs=1e-6)
+    expected, actual = adapter_weights(second), adapter_weights(first)
+    assert expected.keys() == actual.keys()
+    for name in expected:
+        assert torch.allclose(actual[name], expected[name], atol=1e-6, rtol=1e-5), name
+    assert not first.model.training
+
+
+def test_later_epochs_report_ratios_and_clipping(policy, observation, monkeypatch):
+    actor = lora_actor(policy)
+    group = controlled_grpo_group(actor, observation, monkeypatch)
+    optimizer = torch.optim.AdamW((p for p in actor.model.parameters() if p.requires_grad), lr=0.5)
+    result = grpo_update(actor, [group], optimizer, max_grad_norm=1e9, atol=1e-5,
+                         check_post_update=True, update_epochs=3)
+    later = result["later_epochs"]
+    assert later and later[0]["epoch"] == 2
+    for stats in later:
+        assert 0 <= stats["clipped_fraction"] <= 1 and stats["branch_tokens"] > 0
+        assert stats["ratio_min"] <= stats["ratio_mean"] <= stats["ratio_max"]
+    assert result["optimizer_steps"] == 1 + sum(s["optimizer_step_applied"] for s in later)
+    assert result["post_update_token_ratio"] is not None
+    assert json.loads(json.dumps(result, allow_nan=False)) == result
+
+
+def test_later_epoch_clips_only_tokens_already_pushed_far_enough(policy, observation, monkeypatch):
+    from training.grpo import _branch_count, _later_epoch
+
+    actor = lora_actor(policy)
+    group = controlled_grpo_group(actor, observation, monkeypatch)
+    # Pretend the policy already raised every chosen token's probability by e^0.5 (ratio 1.65).
+    for episode in group:
+        for step in episode["steps"]:
+            step["token_log_probs"] = [x - 0.5 if len(c) > 1 else x
+                                       for x, c in zip(step["token_log_probs"], step["token_choices"])]
+    advantages = group_advantages([e["episode_return"] for e in group])
+    assert advantages[0] > 0 > advantages[1]
+    active = [(e, a, _branch_count(e)) for e, a in zip(group, advantages)]
+    trainable = [p for p in actor.model.parameters() if p.requires_grad]
+    frozen = [(p, p._version) for p in actor.model.parameters() if not p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable, lr=1e-3)
+    stats = _later_epoch(actor, optimizer, active, len(group), trainable, frozen, 0.2, 1e9, 2)
+    positive_tokens, negative_tokens = active[0][2], active[1][2]
+    # Positive advantage and ratio > 1.2: clipped (no gradient). Negative advantage: not clipped.
+    assert stats["clipped_fraction"] == pytest.approx(positive_tokens / (positive_tokens + negative_tokens))
+    assert stats["ratio_min"] == pytest.approx(math.exp(0.5), abs=1e-4)
+    assert stats["ratio_max"] == pytest.approx(math.exp(0.5), abs=1e-4)
+    assert stats["optimizer_step_applied"]
+
+    # If every token is clipped, the gradient is zero and no step is taken.
+    before = [p.detach().clone() for p in trainable]
+    only_positive = [active[0]]
+    stats = _later_epoch(actor, optimizer, only_positive, len(group), trainable, frozen, 0.2, 1e9, 3)
+    assert stats["clipped_fraction"] == 1 and not stats["optimizer_step_applied"]
+    assert all(torch.equal(p.detach(), b) for p, b in zip(trainable, before))
+
+
+def test_each_epoch_uses_one_forward_pass_per_step(policy, observation, monkeypatch):
+    actor = lora_actor(policy)
+    group = controlled_grpo_group(actor, observation, monkeypatch)
+    steps = sum(any(len(c) > 1 for c in s["token_choices"]) for e in group for s in e["steps"])
+    optimizer = torch.optim.AdamW((p for p in actor.model.parameters() if p.requires_grad), lr=1e-4)
+    calls, hook = count_forwards(actor.model)
+    try:
+        result = grpo_update(actor, [group], optimizer, max_grad_norm=1e9, atol=1e-5,
+                             check_post_update=False, update_epochs=2)
+    finally:
+        hook.remove()
+    assert result["optimizer_steps"] == 2
+    assert len(calls) == 2 * steps
+
+
+@pytest.mark.parametrize("epochs", [0, -1, 1.5])
+def test_invalid_update_epochs_rejected(policy, observation, monkeypatch, epochs):
+    actor = lora_actor(policy)
+    group = controlled_grpo_group(actor, observation, monkeypatch)
+    optimizer = torch.optim.AdamW((p for p in actor.model.parameters() if p.requires_grad), lr=1e-4)
+    with pytest.raises(ValueError, match="update_epochs"):
+        grpo_update(actor, [group], optimizer, update_epochs=epochs)
+
+
+def replay_actor(policy):
+    actor = WikiGamePolicy(model=deepcopy(policy.model), tokenizer=policy.tokenizer)
+    actor.enable_lora()
+    actor.replay_scoring = True  # No activation checkpointing in this mode.
+    return actor
+
+
+def test_replay_records_sampling_probabilities_without_rescoring(policy, observation):
+    actor = replay_actor(policy)
+    calls, hook = count_forwards(actor.model)
+    try:
+        decision = actor.choose_action(observation, deterministic=False)
+    finally:
+        hook.remove()
+    branches = sum(len(c) > 1 for c in decision["token_choices"])
+    assert branches > 0 and len(calls) == branches  # Cached passes only; no rescoring pass.
+    assert decision["sampling_max_abs_error"] == 0
+    actor.model.train()
+    with torch.enable_grad():
+        replayed = actor.get_token_log_probs(
+            decision["prompt_ids"], decision["token_ids"], decision["token_choices"])
+    actor.model.eval()
+    assert replayed.requires_grad
+    assert replayed.detach().tolist() == pytest.approx(decision["token_log_probs"], abs=1e-6)
+
+
+def test_replay_matches_teacher_forced_scores(policy, observation):
+    actor = replay_actor(policy)
+    for _ in range(3):
+        decision = actor.choose_action(observation, deterministic=False)
+        args = decision["prompt_ids"], decision["token_ids"], decision["token_choices"]
+        with torch.no_grad():
+            replayed = actor._replay_log_probs(*args)
+            forced = actor._step_log_probs(*args)
+        assert torch.allclose(replayed, forced, atol=1e-5)
+
+
+def test_replay_refuses_activation_checkpointing(policy, observation):
+    actor = replay_actor(policy)
+    actor.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    decision = actor.choose_action(observation, deterministic=False)
+    actor.model.train()
+    try:
+        with torch.enable_grad(), pytest.raises(ValueError, match="checkpointing off"):
+            actor.get_token_log_probs(decision["prompt_ids"], decision["token_ids"], decision["token_choices"])
+    finally:
+        actor.model.eval()
+
+
+@pytest.mark.parametrize("epochs", [1, 2])
+def test_grpo_update_with_replay_matches_teacher_forced(policy, observation, monkeypatch, epochs):
+    replay = replay_actor(policy)
+    group = controlled_grpo_group(replay, observation, monkeypatch)
+    forced = WikiGamePolicy(model=deepcopy(replay.model), tokenizer=policy.tokenizer)
+    make = lambda actor: torch.optim.AdamW(
+        (p for p in actor.model.parameters() if p.requires_grad), lr=0.05, weight_decay=0)
+    branches = sum(len(c) > 1 for e in group for step in e["steps"] for c in step["token_choices"])
+    calls, hook = count_forwards(replay.model)
+    try:
+        result = grpo_update(replay, [group], make(replay), max_grad_norm=1e9, atol=1e-5,
+                             check_post_update=False, update_epochs=epochs)
+    finally:
+        hook.remove()
+    assert result["optimizer_steps"] == epochs and result["max_initial_token_log_prob_error"] <= 1e-6
+    assert len(calls) == branches * epochs  # One cached chunk per decision token, per epoch.
+    grpo_update(forced, [deepcopy(group)], make(forced), max_grad_norm=1e9, atol=1e-5,
+                check_post_update=False, update_epochs=epochs)
+    expected, actual = adapter_weights(forced), adapter_weights(replay)
+    for name in expected:
+        assert torch.allclose(actual[name], expected[name], atol=1e-5, rtol=1e-4), name
+    assert not replay.model.training
+
+
+def test_decisions_record_entropies(policy, observation):
+    for deterministic in [False, True]:
+        decision = policy.choose_action(observation, deterministic=deterministic)
+        branches = [c for c in decision["token_choices"] if len(c) > 1]
+        assert len(decision["decision_entropies"]) == len(branches)
+        for entropy, choices in zip(decision["decision_entropies"], branches):
+            assert -1e-6 <= entropy <= math.log(len(choices)) + 1e-6
+
+
 def test_grpo_skips_constant_reward_groups(policy, observation, monkeypatch):
     actor = WikiGamePolicy(model=deepcopy(policy.model), tokenizer=policy.tokenizer)
     actor.enable_lora()
@@ -692,6 +1101,7 @@ def test_grpo_skips_constant_reward_groups(policy, observation, monkeypatch):
         raise AssertionError("Constant returns should not trigger scoring or an optimizer step.")
 
     monkeypatch.setattr(actor, "_next_log_probs", unexpected)
+    monkeypatch.setattr(actor, "_step_log_probs", unexpected)
     monkeypatch.setattr(optimizer, "step", unexpected)
     result = grpo_update(actor, [group], optimizer)
     assert not result["optimizer_step_applied"]
@@ -759,7 +1169,17 @@ def test_grpo_cli_collects_audits_and_reports_update(policy, tmp_path, monkeypat
         assert row["group_summary"]["total_rollouts"] == 4
         if row["validation"]:
             assert row["validation"]["num_episodes"] == 1
-        assert (output / row["checkpoint"] / "adapter" / "adapter_model.safetensors").exists()
+        kept = row["validation"] is not None or row is report["history"][-1]
+        folder = output / row["checkpoint"]
+        # Superseded, unvalidated checkpoints keep only their route report.
+        assert (folder / "adapter" / "adapter_model.safetensors").exists() == kept
+        assert (folder / "trainer_state.pt").exists() == kept
+        assert (folder / "report.json").exists()
+        decision_entropy = row["update"]["decision_entropy"]
+        assert decision_entropy is None or 0 <= decision_entropy["mean_normalized"] <= 1 + 1e-6
+    from training.checkpoint import resolve_resume
+    assert resolve_resume(output)[1].name == "batch_000002"
+    assert report["settings"]["val_seed"] == 42 and report["settings"]["prune_checkpoints"]
     with pytest.raises(SystemExit):
         run(output, 2)  # Existing run directories cannot be overwritten.
     assert report["history"][0]["validation"] is None

@@ -1,4 +1,5 @@
 import json
+import unicodedata
 
 import torch
 from peft import LoraConfig, PeftModel, get_peft_model
@@ -18,6 +19,12 @@ class WikiGamePolicy:
         self.system_prompt = SYSTEM_PROMPT
         self.observation_template = OBSERVATION_TEMPLATE
         self.max_input_tokens = max_input_tokens
+        # When True, training scores a sampled call by replaying the exact cached
+        # computation it was sampled with (needs activation checkpointing off).
+        self.replay_scoring = False
+        # Greedy decisions use the KV-cached path by default; False restores the
+        # original uncached per-prefix decoder (used for the first baselines).
+        self.cached_greedy = True
         device = "cuda" if torch.cuda.is_available() else "cpu"
         dtype = "auto"
         if device == "cuda":
@@ -51,12 +58,32 @@ class WikiGamePolicy:
         ))
         self.model.eval()
 
+    @staticmethod
+    def _title_sort_key(title):
+        """Alphabetical by display title, ignoring case and accents (Åland sorts as Aland)."""
+        plain = "".join(
+            char for char in unicodedata.normalize("NFKD", title) if not unicodedata.combining(char)
+        )
+        return plain.casefold(), title
+
     def build_prompt(self, observation):
-        """Format the visible state without exposing internal Back action IDs."""
+        """Format the visible state; internal environment action IDs are never shown.
+
+        Links are listed alphabetically by title. Links to the current page or to
+        articles already on the visited route are tagged; the tags are display
+        only, since constrained decoding lets the model generate just the title.
+        """
         values = observation.copy()
-        values["links"] = "\n".join(
-            f"{action['id']}: {action['title']}" for action in observation["actions"]
-        ) or "None"
+        visited = set(observation["history"])
+        lines = []
+        for action in sorted(observation["actions"], key=lambda a: self._title_sort_key(a["title"])):
+            title = action["title"]
+            if title == observation["current_title"]:
+                title += " (current page)"
+            elif title in visited:
+                title += " (visited)"
+            lines.append(f"- {title}")
+        values["links"] = "\n".join(lines) or "None"
         values["history"] = " -> ".join(observation["history"])
         values["navigation_stack"] = " -> ".join(observation["navigation_stack"])
         values["back_destination"] = (
@@ -65,13 +92,20 @@ class WikiGamePolicy:
         return self.observation_template.format(**values)
 
     def _tool_calls(self, observation):
-        """Map each legal internal environment action to its native tool call."""
-        calls = {}
+        """Map each legal internal environment action to its native tool call.
+
+        The model names a link by its title; the environment action ID stays
+        internal and is recovered from the title, so titles must be unique.
+        """
+        calls, titles = {}, set()
         for action in observation["actions"]:
-            ident = action["id"]
+            ident, title = action["id"], action["title"]
             if type(ident) is not int or ident < 0 or ident in calls:
                 raise ValueError("Link IDs must be unique nonnegative integers.")
-            calls[ident] = {"name": "follow_link", "arguments": {"link_id": ident}}
+            if not isinstance(title, str) or not title.strip() or title in titles:
+                raise ValueError(f"Link titles must be unique nonempty strings: {title!r}")
+            titles.add(title)
+            calls[ident] = {"name": "follow_link", "arguments": {"title": title}}
         if observation["back_available"]:
             ident = observation["back_action_id"]
             if type(ident) is not int or ident < 0 or ident in calls:
@@ -82,10 +116,13 @@ class WikiGamePolicy:
         return calls
 
     def _action_sequences(self, calls):
-        """Use one canonical Hermes-style encoding per action, ending at EOS."""
+        """Use one canonical Hermes-style encoding per action, ending at EOS.
+
+        Titles stay as UTF-8 text (e.g. "Côte d'Ivoire"), not \\u escapes.
+        """
         return {
             action: self.tokenizer.encode(
-                "<tool_call>\n" + json.dumps(call) + "\n</tool_call>",
+                "<tool_call>\n" + json.dumps(call, ensure_ascii=False) + "\n</tool_call>",
                 add_special_tokens=False,
             ) + [self.tokenizer.eos_token_id]
             for action, call in calls.items()
@@ -142,19 +179,139 @@ class WikiGamePolicy:
         ).logits[0, -1].float()
         return torch.log_softmax(logits[choices], dim=-1)
 
+    def _decoder(self):
+        """The transformer body (LoRA layers are injected in place) and its output layer."""
+        base = self.model.get_base_model() if isinstance(self.model, PeftModel) else self.model
+        return base.model, base.get_output_embeddings()
+
+    def _hidden(self, input_ids, past_key_values=None, use_cache=False):
+        """Final normalized hidden states; the full-vocabulary logits are never formed."""
+        body, _ = self._decoder()
+        ids = torch.tensor([input_ids], device=self.model.device, dtype=torch.long)
+        output = body(input_ids=ids, past_key_values=past_key_values, use_cache=use_cache)
+        return output.last_hidden_state[0], output.past_key_values
+
+    def _choice_log_probs(self, hidden, choices):
+        """Log probabilities over the legal tokens, with the output layer in float32.
+
+        bfloat16 logits of size 16-64 are rounded to steps of 0.125-0.25, so two
+        computations that accumulate in a different order can disagree by whole
+        rounding steps. Scoring only the legal rows in float32 removes that.
+        """
+        _, head = self._decoder()
+        logits = hidden.float() @ head.weight[choices].float().T
+        if head.bias is not None:
+            logits = logits + head.bias[choices].float()
+        return torch.log_softmax(logits, dim=-1)
+
+    def _sample_cached(self, prompt_ids, sequences, greedy=False):
+        """Choose one legal call, reusing a KV cache between branching points.
+
+        The prompt is encoded once; each later forward pass only covers the tokens
+        appended since the previous branch. Forced tokens need no forward pass of
+        their own. greedy=True takes the most likely legal token at each decision
+        instead of sampling. Returns the tokens, their legal-token masks, and the
+        log probabilities the choices were made from.
+        """
+        tokens, token_choices, sampled = [], [], []
+        self._last_entropies = []
+        cache, pending = None, list(prompt_ids)
+        for _ in range(max(map(len, sequences.values()))):
+            choices = self._allowed_tokens(sequences, tokens)
+            if not choices:
+                raise RuntimeError("Generation reached an invalid tool-call prefix.")
+            if len(choices) == 1:
+                token, score = choices[0], 0.0
+            else:
+                hidden, cache = self._hidden(pending, past_key_values=cache, use_cache=True)
+                pending = []
+                log_probs = self._choice_log_probs(hidden[-1], choices)
+                self._last_entropies.append(-(log_probs.exp() * log_probs).sum().item())
+                index = (log_probs.argmax().item() if greedy
+                         else torch.multinomial(log_probs.exp(), num_samples=1).item())
+                token, score = choices[index], log_probs[index].item()
+            tokens.append(token)
+            token_choices.append(choices)
+            sampled.append(score)
+            pending.append(token)
+            if token == self.tokenizer.eos_token_id:
+                break
+        return tokens, token_choices, sampled
+
+    def _replay_log_probs(self, prompt_ids, token_ids, token_choices):
+        """Score a sampled call with exactly the cached computation it was drawn from.
+
+        _sample_cached feeds the prompt plus forced tokens up to the first decision,
+        then, for each later decision, the previous chosen token plus forced tokens
+        since, reusing the KV cache. Replaying the same chunks reproduces the
+        sampling probabilities exactly, so no separate rescoring pass is needed.
+        """
+        self._check_recorded(prompt_ids, token_ids, token_choices)
+        body, _ = self._decoder()
+        if torch.is_grad_enabled() and self.model.training and getattr(body, "gradient_checkpointing", False):
+            raise ValueError("Replay scoring needs activation checkpointing off (it disables the KV cache).")
+        zero = torch.zeros((), device=self.model.device, requires_grad=torch.is_grad_enabled())
+        scores = [zero] * len(token_ids)
+        cache, start, pending = None, 0, list(prompt_ids)
+        for i, choices in enumerate(token_choices):
+            if len(choices) == 1:
+                continue
+            hidden, cache = self._hidden(pending + token_ids[start:i], past_key_values=cache, use_cache=True)
+            scores[i] = self._choice_log_probs(hidden[-1], choices)[choices.index(token_ids[i])]
+            pending, start = [], i
+        return torch.stack(scores)
+
+    def _check_recorded(self, prompt_ids, token_ids, token_choices):
+        if not prompt_ids or not token_ids or len(token_ids) != len(token_choices):
+            raise ValueError("Provide a prompt and matching token/mask sequences.")
+        for token, choices in zip(token_ids, token_choices):
+            if not choices or len(choices) != len(set(choices)) or token not in choices:
+                raise ValueError("Each recorded token must have a valid legal-token mask.")
+
     @torch.no_grad()
     def choose_action(self, observation, deterministic=False):
-        """Query the model only at branching prefixes of the legal-call grammar.
+        """Choose one legal call; forced syntax never needs a forward pass.
 
-        Forced syntax has probability one and is appended without a forward pass.
-        Actual choices use the same uncached calculation as training, with
-        temperature 1 and no top-k/top-p filtering.
+        Greedy decisions (evaluation) use the same KV-cached path with argmax and
+        record the probabilities they were chosen from. With cached_greedy=False
+        they instead query the model uncached at each branching prefix, the
+        decoder the first baselines were produced with.
+
+        Sampled decisions (training rollouts) draw with a KV cache, then record
+        token log probabilities from one teacher-forced pass over the chosen call:
+        the same calculation training uses, so the recorded behavior
+        probabilities are reproduced exactly at update time. The draw itself
+        used the cached probabilities, which agree up to floating-point rounding;
+        sampling_max_abs_error reports the largest difference. Temperature is 1
+        with no top-k/top-p filtering.
         """
         self.model.eval()
         calls = self._tool_calls(observation)
         sequences = self._action_sequences(calls)
         inputs = self._prepare_inputs(observation, max(map(len, sequences.values())))
         prompt_ids = inputs["input_ids"][0].tolist()
+        if not deterministic or self.cached_greedy:
+            tokens, token_choices, sampled = self._sample_cached(prompt_ids, sequences, greedy=deterministic)
+            action = next((a for a, sequence in sequences.items() if sequence == tokens), None)
+            if action is None:
+                raise RuntimeError("Generation did not produce a complete legal tool call.")
+            if deterministic or self.replay_scoring:
+                scores = sampled  # Greedy decisions are not trained on; replay reproduces these exactly.
+            elif any(len(choices) > 1 for choices in token_choices):
+                scores = self._step_log_probs(prompt_ids, tokens, token_choices).tolist()
+            else:
+                scores = [0.0] * len(tokens)
+            errors = [abs(a - b) for a, b, c in zip(sampled, scores, token_choices) if len(c) > 1]
+            return {
+                "action": action, "tool_call": calls[action], "prompt_ids": prompt_ids,
+                "token_ids": tokens, "token_choices": token_choices,
+                "token_log_probs": scores,
+                "log_prob": torch.tensor(scores, device=self.model.device, dtype=torch.float32).sum().item(),
+                "sampling_abs_errors": errors,
+                "sampling_max_abs_error": max(errors, default=0.0),
+                # Entropy of each decision's legal-token distribution, in nats.
+                "decision_entropies": self._last_entropies,
+            }
         tokens, token_choices, scores = [], [], []
         for _ in range(max(map(len, sequences.values()))):
             choices = self._allowed_tokens(sequences, tokens)
@@ -183,16 +340,43 @@ class WikiGamePolicy:
             "log_prob": torch.tensor(scores, device=self.model.device, dtype=torch.float32).sum().item(),
         }
 
+    def _step_log_probs(self, prompt_ids, token_ids, token_choices):
+        """Score a whole recorded call with one teacher-forced forward pass.
+
+        The model reads the prompt plus every recorded token except the last; the
+        hidden states at the final len(token_ids) positions predict each recorded
+        token, scored over its legal tokens in float32. Forced tokens contribute zero.
+        """
+        self._check_recorded(prompt_ids, token_ids, token_choices)
+        zero = torch.zeros((), device=self.model.device, requires_grad=torch.is_grad_enabled())
+        branches = [i for i, choices in enumerate(token_choices) if len(choices) > 1]
+        if not branches:
+            return torch.stack([zero] * len(token_ids))
+        hidden, _ = self._hidden(prompt_ids + token_ids[:-1])
+        hidden = hidden[-len(token_ids):]  # Row i predicts token_ids[i].
+        scores = [zero] * len(token_ids)
+        for i in branches:
+            choices = token_choices[i]
+            scores[i] = self._choice_log_probs(hidden[i], choices)[choices.index(token_ids[i])]
+        return torch.stack(scores)
+
     def get_token_log_probs(self, prompt_ids, token_ids, token_choices):
         """Score recorded tokens with gradients, using their exact input and masks.
 
-        Forced tokens contribute zero. Training controls model mode; keep dropout
-        disabled when comparing rollout and training probabilities.
+        With replay_scoring, this replays the cached sampling computation exactly;
+        otherwise it is one teacher-forced pass per call, which sampled decisions
+        then record. Forced tokens contribute zero. Training controls model mode;
+        keep dropout disabled when comparing rollout and training probabilities.
         """
-        return torch.stack(list(self.iter_token_log_probs(prompt_ids, token_ids, token_choices)))
+        if self.replay_scoring:
+            return self._replay_log_probs(prompt_ids, token_ids, token_choices)
+        return self._step_log_probs(prompt_ids, token_ids, token_choices)
 
     def iter_token_log_probs(self, prompt_ids, token_ids, token_choices):
-        """Yield scores separately so training can backpropagate one branch at a time."""
+        """Reference scorer: one uncached forward pass per branching prefix.
+
+        This is the calculation greedy decisions use; it is kept to check them.
+        """
         if not prompt_ids or not token_ids or len(token_ids) != len(token_choices):
             raise ValueError("Provide a prompt and matching token/mask sequences.")
         zero = torch.zeros((), device=self.model.device, requires_grad=torch.is_grad_enabled())

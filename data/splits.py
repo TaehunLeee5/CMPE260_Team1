@@ -191,7 +191,8 @@ def main():
     parser = argparse.ArgumentParser(description="Create reproducible Wiki Game experiment splits.")
     parser.add_argument('--graph-folder', type=Path, default=ROOT/'data/raw/graph')
     parser.add_argument('--article-order', type=Path, default=ROOT/'data/processed/article_order.json')
-    parser.add_argument('--previous-splits', type=Path, default=ROOT/'data/processed')
+    parser.add_argument('--previous-splits', type=Path, nargs='+', default=[ROOT/'data/processed'],
+                        help='One or more folders whose train/val/test pairs must be excluded.')
     parser.add_argument('--num-tasks', type=int, default=5000)
     parser.add_argument('--pilot-size', type=int, default=800)
     parser.add_argument('--output', type=Path)
@@ -205,7 +206,11 @@ def main():
         if not 1 <= args.pilot_size <= args.num_tasks * 8 // 10:
             raise ValueError('--pilot-size must fit inside the training split.')
         ids, matrix = load_data(args.graph_folder, args.article_order)
-        old_pairs, old_files = prior_pairs(args.previous_splits)
+        old_pairs, old_files = set(), []
+        for folder in args.previous_splits:
+            pairs, files = prior_pairs(folder)
+            old_pairs |= pairs
+            old_files.extend(files)
         results = ROOT / 'evaluation/results'
         debug_pairs, debug_files = observed_pairs(
             [results/name for name in ['baseline.json', 'baseline_colon_4096.json',
