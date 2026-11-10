@@ -105,11 +105,12 @@ def evaluate(runner, tasks, *, deterministic=True, rollouts=1, seed=42):
     report = {
         "summary": summary, "episodes": results,
         "settings": {
-            "max_clicks": runner.env.max_clicks, "deterministic": deterministic,
+            "max_clicks": runner.env.max_clicks, "reward": runner.env.reward_mode,
+            "deterministic": deterministic,
             "rollouts_per_task": rollouts, "rollout_seed": seed if not deterministic else None,
         },
     }
-    report["route_audit"] = analyze_routes(report, runner.env.articles)["summary"]
+    report["route_audit"] = analyze_routes(report, runner.env.articles, runner.env.route_return)["summary"]
     if rollouts > 1:
         report["groups"], report["group_summary"] = summarize_groups(results)
     return report

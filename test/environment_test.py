@@ -226,3 +226,131 @@ def test_out_of_range_action_does_not_change_state(env):
     with pytest.raises(ValueError, match="outside the action space"):
         env.step(env.action_space.n)
     assert env.get_info() == before
+
+
+
+@pytest.fixture
+def progress_files(tmp_path):
+    """The fixture graph plus its shortest-path matrix, in articles.json order."""
+    articles = {
+        "Start": {"title": "Start", "text": "Start.", "outgoing": ["Start", "Middle", "Dead_end"]},
+        "Middle": {"title": "Middle", "text": "Middle.", "outgoing": ["Goal"]},
+        "Goal": {"title": "Goal", "text": "Goal.", "outgoing": ["Start"]},
+        "Dead_end": {"title": "Dead end", "text": "Dead end.", "outgoing": []},
+    }
+    paths = {name: tmp_path / name for name in ["articles.json", "matrix.txt", "order.json"]}
+    paths["articles.json"].write_text(json.dumps(articles), encoding="utf-8")
+    # Rows: from Start, Middle, Goal, Dead_end; columns in the same order.
+    paths["matrix.txt"].write_text("# comment\n0121\n2013\n1202\n___0\n", encoding="utf-8")
+    paths["order.json"].write_text(json.dumps(list(articles)), encoding="utf-8")
+    return paths
+
+
+def progress_env(paths, max_clicks):
+    return WikiGameEnv(paths["articles.json"], max_clicks=max_clicks, reward="progress",
+                       distance_matrix_path=paths["matrix.txt"], article_order_path=paths["order.json"])
+
+
+@pytest.mark.parametrize("action, expected", [
+    (1, 0.25 * (2 - 1) / 2),  # Middle is one click from Goal: half of the possible progress.
+    (0, 0.0),                 # Self-link: still two clicks away.
+    (2, 0.0),                 # Dead end: Goal is unreachable from there.
+])
+def test_progress_credit_for_failed_routes(progress_files, action, expected):
+    env = progress_env(progress_files, max_clicks=1)
+    env.reset(options={"start": "Start", "target": "Goal"})
+    _, reward, terminated, _, info = env.step(action)
+    assert terminated and info["reason"] == "click_budget"
+    assert reward == pytest.approx(expected) and info["episode_return"] == pytest.approx(expected)
+    assert env.route_return(info["path"], "Goal", 1, False) == pytest.approx(expected)
+
+
+def test_progress_is_paid_when_reached_and_success_gets_full_credit(progress_files):
+    env = progress_env(progress_files, max_clicks=2)
+    env.reset(options={"start": "Start", "target": "Goal"})
+    assert env.step(1)[1] == pytest.approx(0.125)  # New closest distance: paid immediately.
+    _, reward, terminated, _, info = env.step(0)    # Middle -> Goal.
+    assert terminated and info["success"]
+    assert reward == pytest.approx(0.125 + 1.0)    # Last bit of progress plus the success reward.
+    assert info["episode_return"] == pytest.approx(1.25)
+    assert env.route_return(info["path"], "Goal", 2, True) == pytest.approx(1.25)
+
+
+def test_revisits_and_lingering_earn_nothing(progress_files):
+    env = progress_env(progress_files, max_clicks=3)
+    env.reset(options={"start": "Start", "target": "Goal"})
+    rewards = [env.step(1)[1], env.step(env.back_action)[1]]
+    env.reset(options={"start": "Start", "target": "Goal"})
+    env.step(1)                       # Start -> Middle (+0.125)
+    env.step(env.back_action)         # back to Start
+    _, reward, terminated, _, info = env.step(1)  # Middle again: not a new closest distance.
+    assert rewards == pytest.approx([0.125, 0.0]) and reward == 0.0
+    assert terminated and info["episode_return"] == pytest.approx(0.125)
+
+
+def test_every_success_outranks_every_failure(progress_files):
+    env = progress_env(progress_files, max_clicks=20)
+    slowest_success = env.route_return(["Start"] * 20 + ["Goal"], "Goal", 20, True)
+    best_failure = env.route_return(["Start", "Middle"], "Goal", 20, False)
+    assert slowest_success == pytest.approx(1.25)
+    assert best_failure == pytest.approx(0.125)
+    assert best_failure < env.PROGRESS_WEIGHT < slowest_success
+    assert env.shortest_distance("Dead_end", "Goal") is None
+    assert env.shortest_distance("Middle", "Dead_end") == 3
+
+
+def test_distance_matrix_must_match_the_link_graph(progress_files):
+    # Valid format, but Start -> Goal is really 2 clicks (via Middle), not 3.
+    progress_files["matrix.txt"].write_text("0131\n2013\n1202\n___0\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="does not match the link graph"):
+        progress_env(progress_files, 1)
+
+
+def test_success_reward_needs_no_matrix(env):
+    """The default reward loads no matrix, and failures still earn exactly zero."""
+    env.reset(options={"start": "Start", "target": "Goal"})
+    env.step(1)  # Start -> Middle, one click from Goal: no credit under the default reward.
+    _, reward, terminated, _, info = env.step(env.back_action)
+    assert env.reward_mode == "success" and terminated and not info["success"] and reward == 0.0
+    with pytest.raises(ValueError, match="only loaded"):
+        env.shortest_distance("Start", "Goal")
+
+
+def test_progress_reward_rejects_misaligned_inputs(progress_files):
+    progress_files["order.json"].write_text(json.dumps(["Middle", "Start", "Goal", "Dead_end"]), encoding="utf-8")
+    with pytest.raises(ValueError, match="article order"):
+        progress_env(progress_files, 1)
+    progress_files["order.json"].write_text(json.dumps(["Start", "Middle", "Goal", "Dead_end"]), encoding="utf-8")
+    progress_files["matrix.txt"].write_text("0121\n2013\n1202\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="number of rows"):
+        progress_env(progress_files, 1)
+    progress_files["matrix.txt"].write_text("0121\n2013\n1202\n__0_\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Invalid distance matrix row"):
+        progress_env(progress_files, 1)
+    with pytest.raises(ValueError, match="reward must be"):
+        WikiGameEnv(progress_files["articles.json"], reward="dense")
+
+
+
+def test_progress_episodes_pass_the_training_audit(progress_files):
+    """Run real episodes through the runner and the training report path."""
+    from environment.episode_runner import EpisodeRunner
+    from evaluation.audit_saved_routes import analyze_routes
+    from training.grpo import collect_groups, compact_report
+
+    class TowardMiddle:
+        def choose_action(self, observation, deterministic=False):
+            action = next(a for a in observation["actions"] if a["title"] == "Middle")
+            return {"action": action["id"], "log_prob": 0.0,
+                    "tool_call": {"name": "follow_link", "arguments": {"title": "Middle"}}}
+
+    env = progress_env(progress_files, max_clicks=1)
+    runner = EpisodeRunner(env, TowardMiddle())
+    groups = collect_groups(runner, [{"start": "Start", "target": "Goal", "shortest_distance": 2}],
+                            rollouts=2, seed=None)
+    for episode in groups[0]:
+        assert not episode["success"] and episode["episode_return"] == pytest.approx(0.125)
+    report = compact_report(groups, env.max_clicks, env.reward_mode)
+    assert report["settings"]["reward"] == "progress"
+    audit = analyze_routes(report, env.articles, env.route_return)["summary"]
+    assert audit["all_recorded_transitions_and_returns_valid"] and audit["failures"] == 2

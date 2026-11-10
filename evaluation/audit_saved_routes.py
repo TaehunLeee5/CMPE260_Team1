@@ -26,7 +26,7 @@ def link_index(arguments, outgoing, articles):
     return None
 
 
-def _analyze_episode(episode, articles, budget):
+def _analyze_episode(episode, articles, budget, reward_fn=None):
     start, target = episode["start"], episode["target"]
     path, clicks = episode["path"], episode["clicks"]
     label = f"{start} -> {target}"
@@ -109,7 +109,10 @@ def _analyze_episode(episode, articles, budget):
         raise ValueError(f"{label}: termination reason disagrees with the route.")
     if episode.get("terminated") is not True or episode.get("truncated") is not False:
         raise ValueError(f"{label}: termination flags disagree with the finite-horizon task.")
-    expected_return = 1 + 0.1 * (budget - clicks) / budget if success else 0.0
+    if reward_fn is not None:
+        expected_return = reward_fn(path, target, clicks, success)
+    else:
+        expected_return = 1 + 0.1 * (budget - clicks) / budget if success else 0.0
     recorded_return = episode.get("episode_return")
     if (type(recorded_return) not in (int, float) or not math.isfinite(recorded_return)
             or not math.isclose(recorded_return, expected_return, abs_tol=1e-8, rel_tol=0)):
@@ -147,20 +150,27 @@ def _analyze_episode(episode, articles, budget):
     }
 
 
-def analyze_routes(report, articles):
-    """Replay current-format tool traces; fail rather than accept inconsistent logs."""
+def analyze_routes(report, articles, reward_fn=None):
+    """Replay current-format tool traces; fail rather than accept inconsistent logs.
+
+    reward_fn(path, target, clicks, success) recomputes each episode's return;
+    pass an environment's route_return. Without it, the original
+    success-only reward is assumed, which reports with reward="progress" reject.
+    """
     if not isinstance(report, dict) or not isinstance(report.get("settings", {}), dict):
         raise ValueError("Results and settings must be JSON objects.")
     episodes = report.get("episodes")
     settings = report.get("settings", {})
     budget = settings.get("max_clicks")
+    if settings.get("reward", "success") == "progress" and reward_fn is None:
+        raise ValueError("Progress-reward results need distances to check returns; pass reward_fn.")
     if not isinstance(episodes, list) or not episodes:
         raise ValueError("Results need a nonempty episodes list.")
     if type(budget) is not int or budget < 1:
         raise ValueError("Results settings must contain a positive max_clicks.")
     if not isinstance(articles, dict) or not articles:
         raise ValueError("Article graph must be a nonempty dictionary.")
-    results = [_analyze_episode(episode, articles, budget) for episode in episodes]
+    results = [_analyze_episode(episode, articles, budget, reward_fn) for episode in episodes]
     failures = [episode for episode in results if not episode["success"]]
     opportunities = sum(e["direct_target_opportunities"] for e in results)
     clicked = sum(len(e["target_clicked_steps"]) for e in results)
@@ -209,7 +219,13 @@ def main():
     try:
         report = json.loads(args.results.read_text(encoding="utf-8"))
         articles = json.loads(args.articles.read_text(encoding="utf-8"))
-        audit = analyze_routes(report, articles)
+        settings = report.get("settings", {}) if isinstance(report, dict) else {}
+        reward_fn = None
+        if isinstance(settings, dict) and settings.get("reward") == "progress":
+            from environment.environment import WikiGameEnv
+            reward_fn = WikiGameEnv(args.articles, max_clicks=settings["max_clicks"],
+                                    reward="progress").route_return
+        audit = analyze_routes(report, articles, reward_fn)
     except (OSError, ValueError, KeyError, TypeError, IndexError) as error:
         parser.exit(1, f"Route audit failed: {error}\n")
     audit["inputs"] = {"results": str(args.results), "articles": str(args.articles)}
