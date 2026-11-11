@@ -20,7 +20,7 @@ from environment.environment import WikiGameEnv
 from environment.episode_runner import EpisodeRunner
 from evaluation.audit_saved_routes import analyze_routes
 from evaluation.evaluate import evaluate, summarize_groups
-from policy.llm_policy import WikiGamePolicy
+from policy.llm_policy import PROMPT_STYLES, WikiGamePolicy
 from training.checkpoint import (capture_rng, read_checkpoint, resolve_resume, restore_rng,
                                  restore_training_state, save_checkpoint, write_json)
 
@@ -374,6 +374,7 @@ DEFAULTS = {
     "max_input_tokens": 4096, "learning_rate": 1e-5, "clip_range": 0.2,
     "max_grad_norm": 1.0, "val_limit": 100, "eval_every": 10, "min_advantage_std": 0.1,
     "update_epochs": 2, "activation_checkpointing": True, "val_seed": 42, "reward": "success",
+    "prompt_style": "article_text",
 }
 
 
@@ -493,6 +494,9 @@ def main():
         parser.add_argument("--" + flag.replace("_", "-"), type=int, help=f"Default: {DEFAULTS[flag]}")
     for flag in ["learning_rate", "clip_range", "max_grad_norm", "min_advantage_std"]:
         parser.add_argument("--" + flag.replace("_", "-"), type=float, help=f"Default: {DEFAULTS[flag]}")
+    parser.add_argument("--prompt-style", choices=PROMPT_STYLES,
+                        help="article_text (default) or link_context (needs --articles "
+                             "data/processed/articles_context.json).")
     parser.add_argument("--reward", choices=["success", "progress"],
                         help='Failed routes earn 0 ("success", default) or partial credit for '
                              'ending closer to the target ("progress").')
@@ -580,7 +584,8 @@ def main():
                     env.shortest_distance(task["start"], task["target"]) != task["shortest_distance"]:
                 raise ValueError("The distance matrix disagrees with a task's shortest_distance.")
         set_seed(config["seed"])
-        policy = WikiGamePolicy(max_input_tokens=config["max_input_tokens"])
+        policy = WikiGamePolicy(max_input_tokens=config["max_input_tokens"],
+                                prompt_style=config.get("prompt_style", "article_text"))
         if payload:
             policy.model = PeftModel.from_pretrained(policy.model, checkpoint / "adapter",
                                                      is_trainable=True, local_files_only=True)

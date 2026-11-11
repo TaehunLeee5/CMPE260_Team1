@@ -209,10 +209,17 @@ class WikiGameEnv(gym.Env):
             raise gym.error.ResetNeeded("Call reset() before requesting an observation.")
         actions = []
         back_available = not self.done and len(self.navigation_stack) > 1
+        page = self.articles[self.current]
+        has_context = "link_order" in page  # Added by data/link_context.py.
+        positions = {link: i for i, link in enumerate(page.get("link_order", []))}
         if not self.done:
-            for index, article_id in enumerate(self.articles[self.current]["outgoing"]):
-                actions.append({"id": index, "title": self.articles[article_id]["title"]})
-        return {
+            for index, article_id in enumerate(page["outgoing"]):
+                action = {"id": index, "title": self.articles[article_id]["title"]}
+                if has_context:
+                    action["position"] = positions.get(article_id)
+                    action["context"] = page["link_context"].get(article_id)
+                actions.append(action)
+        observation = {
             "current_title": self.articles[self.current]["title"],
             "target_title": self.articles[self.target]["title"],
             "text": self.articles[self.current]["text"],
@@ -226,6 +233,9 @@ class WikiGameEnv(gym.Env):
             "back_action_id": self.back_action if back_available else None,
             "remaining_clicks": self.max_clicks - self.clicks,
         }
+        if has_context:
+            observation["lead"] = page.get("lead")
+        return observation
 
     def get_info(self):
         """Return episode metrics and the visited route for debugging and evaluation."""

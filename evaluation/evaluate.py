@@ -11,7 +11,7 @@ from transformers import set_seed
 from environment.environment import WikiGameEnv
 from environment.episode_runner import EpisodeRunner
 from evaluation.audit_saved_routes import analyze_routes
-from policy.llm_policy import WikiGamePolicy
+from policy.llm_policy import PROMPT_STYLES, WikiGamePolicy
 
 
 def evaluate(runner, tasks, *, deterministic=True, rollouts=1, seed=42):
@@ -157,6 +157,9 @@ def main():
     parser.add_argument("--distance", type=int,
                         help="Keep only tasks with this shortest distance, before applying --limit.")
     parser.add_argument("--sample", action="store_true", help="Sample actions instead of greedy decoding.")
+    parser.add_argument("--articles", type=Path, default=Path("data/processed/articles.json"),
+                        help="Article data; link_context needs data/processed/articles_context.json.")
+    parser.add_argument("--prompt-style", choices=PROMPT_STYLES, default="article_text")
     parser.add_argument("--uncached-greedy", action="store_true",
                         help="Use the original uncached greedy decoder (reproduces the first baselines).")
     parser.add_argument("--rollouts", type=int, default=1, help="Sampled routes per task (default: 1).")
@@ -201,14 +204,15 @@ def main():
     if args.limit is not None:
         tasks = random.Random(args.seed).sample(tasks, min(args.limit, len(tasks)))
 
-    env = WikiGameEnv(max_clicks=args.max_clicks)
+    env = WikiGameEnv(articles_path=args.articles, max_clicks=args.max_clicks)
     try:
         for task in tasks:
             env.validate_pair(task["start"], task["target"])
 
         if args.uncached_greedy and args.sample:
             parser.error("--uncached-greedy applies to greedy evaluation only.")
-        policy = WikiGamePolicy(max_input_tokens=4096, adapter_path=args.adapter)
+        policy = WikiGamePolicy(max_input_tokens=4096, adapter_path=args.adapter,
+                                prompt_style=args.prompt_style)
         policy.cached_greedy = not args.uncached_greedy
         runner = EpisodeRunner(env, policy)
         report = evaluate(
@@ -226,6 +230,7 @@ def main():
             "follow_link_argument": "title",
             "enable_thinking": False,
             "use_cache": not args.uncached_greedy,
+            "prompt_style": args.prompt_style, "articles": str(args.articles),
             "decoder": ("kv_cached_sampling_then_teacher_forced_rescore" if args.sample
                         else "forced_token_skip" if args.uncached_greedy
                         else "kv_cached_greedy_float32_choices"),

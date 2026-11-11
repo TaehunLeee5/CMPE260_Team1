@@ -5,19 +5,35 @@ import torch
 from peft import LoraConfig, PeftModel, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from policy.prompt import OBSERVATION_TEMPLATE, SYSTEM_PROMPT, TOOLS
+from policy.prompt import (LINK_CONTEXT_SYSTEM_PROMPT, LINK_CONTEXT_TEMPLATE, OBSERVATION_TEMPLATE,
+                           SYSTEM_PROMPT, TOOLS)
+
+
+PROMPT_STYLES = ("article_text", "link_context")
 
 
 class WikiGamePolicy:
     """Generate one legal Qwen tool call and retain its token probabilities."""
 
+    PROMPT_STYLES = PROMPT_STYLES
+
     def __init__(self, model_name="Qwen/Qwen3-1.7B", max_input_tokens=4096,
-                 *, model=None, tokenizer=None, adapter_path=None):
-        """Load the actor or injected model, optionally adding a frozen local adapter."""
+                 *, model=None, tokenizer=None, adapter_path=None, prompt_style="article_text"):
+        """Load the actor or injected model, optionally adding a frozen local adapter.
+
+        prompt_style="article_text" shows the current article's text (truncated to
+        fit); "link_context" shows its opening paragraph and each link with the
+        sentence it appears in, which needs articles processed by data/link_context.py.
+        """
         if max_input_tokens is not None and max_input_tokens < 1:
             raise ValueError("The input token budget must be positive.")
-        self.system_prompt = SYSTEM_PROMPT
-        self.observation_template = OBSERVATION_TEMPLATE
+        if prompt_style not in self.PROMPT_STYLES:
+            raise ValueError(f"prompt_style must be one of {self.PROMPT_STYLES}.")
+        self.prompt_style = prompt_style
+        if prompt_style == "link_context":
+            self.system_prompt, self.observation_template = LINK_CONTEXT_SYSTEM_PROMPT, LINK_CONTEXT_TEMPLATE
+        else:
+            self.system_prompt, self.observation_template = SYSTEM_PROMPT, OBSERVATION_TEMPLATE
         self.max_input_tokens = max_input_tokens
         # When True, training scores a sampled call by replaying the exact cached
         # computation it was sampled with (needs activation checkpointing off).
@@ -76,20 +92,39 @@ class WikiGamePolicy:
         values = observation.copy()
         visited = set(observation["history"])
         lines = []
-        for action in sorted(observation["actions"], key=lambda a: self._title_sort_key(a["title"])):
+        if self.prompt_style == "link_context":
+            if "lead" not in observation:
+                raise ValueError("link_context prompts need articles processed by data/link_context.py.")
+            actions = self._page_order(observation["actions"])
+            shown = observation.get("context_limit", len(actions))
+            with_context = 0
+        else:
+            actions = sorted(observation["actions"], key=lambda a: self._title_sort_key(a["title"]))
+        for action in actions:
             title = action["title"]
             if title == observation["current_title"]:
                 title += " (current page)"
             elif title in visited:
                 title += " (visited)"
+            if self.prompt_style == "link_context" and action.get("context"):
+                if with_context < shown:
+                    title += f': "{action["context"]}"'
+                with_context += 1
             lines.append(f"- {title}")
         values["links"] = "\n".join(lines) or "None"
+        if self.prompt_style == "link_context":
+            values["lead"] = observation["lead"] or "(not available)"
         values["history"] = " -> ".join(observation["history"])
         values["navigation_stack"] = " -> ".join(observation["navigation_stack"])
         values["back_destination"] = (
             observation["back_destination"] if observation["back_available"] else "unavailable"
         )
         return self.observation_template.format(**values)
+
+    def _page_order(self, actions):
+        """Links in the order they appear on the page; links not shown on it go last, alphabetically."""
+        return sorted(actions, key=lambda a: (a.get("position") is None, a.get("position") or 0,
+                                              self._title_sort_key(a["title"])))
 
     def _tool_calls(self, observation):
         """Map each legal internal environment action to its native tool call.
@@ -148,13 +183,19 @@ class WikiGamePolicy:
         )
 
     def _prepare_inputs(self, observation, output_tokens):
-        """Preserve tools and state; shorten only current article text to fit."""
+        """Preserve tools, state and every link title; shorten only article content to fit.
+
+        article_text: truncate the article text. link_context: drop link
+        sentences from the bottom of the list first, then shorten the lead.
+        """
         limit = self.model.config.max_position_embeddings - output_tokens
         if self.max_input_tokens is not None:
             limit = min(limit, self.max_input_tokens)
         if limit < 1:
             raise ValueError("The input token budget must be positive.")
         visible = observation.copy()
+        if self.prompt_style == "link_context":
+            return self._fit_link_context(visible, limit)
         text_tokens = self.tokenizer.encode(observation["text"], add_special_tokens=False)
         while True:
             inputs = self._encode_observation(visible)
@@ -167,6 +208,36 @@ class WikiGamePolicy:
             visible["text"] = self.tokenizer.decode(
                 text_tokens, clean_up_tokenization_spaces=False,
             )
+
+    def _fit_link_context(self, visible, limit):
+        fits = lambda inputs: inputs["input_ids"].shape[1] <= limit
+        inputs = self._encode_observation(visible)
+        if fits(inputs):
+            return inputs.to(self.model.device)
+        # Keep the largest number of link sentences that fits (binary search).
+        low, high = 0, sum(1 for a in visible["actions"] if a.get("context"))
+        best = None
+        while low <= high:
+            middle = (low + high) // 2
+            visible["context_limit"] = middle
+            candidate = self._encode_observation(visible)
+            if fits(candidate):
+                best, low = candidate, middle + 1
+            else:
+                high = middle - 1
+        if best is not None:
+            return best.to(self.model.device)
+        visible["context_limit"] = 0
+        lead_tokens = self.tokenizer.encode(visible["lead"] or "", add_special_tokens=False)
+        while True:
+            inputs = self._encode_observation(visible)
+            overflow = inputs["input_ids"].shape[1] - limit
+            if overflow <= 0:
+                return inputs.to(self.model.device)
+            if not lead_tokens:
+                raise ValueError("The tools, state, and link titles exceed the input token budget.")
+            lead_tokens = lead_tokens[:max(0, len(lead_tokens) - overflow)]
+            visible["lead"] = self.tokenizer.decode(lead_tokens, clean_up_tokenization_spaces=False)
 
     def _next_log_probs(self, prompt_ids, prefix, choices):
         """Shared full-prefix calculation for rollout and gradient-enabled scoring."""

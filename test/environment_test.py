@@ -354,3 +354,25 @@ def test_progress_episodes_pass_the_training_audit(progress_files):
     assert report["settings"]["reward"] == "progress"
     audit = analyze_routes(report, env.articles, env.route_return)["summary"]
     assert audit["all_recorded_transitions_and_returns_valid"] and audit["failures"] == 2
+
+
+
+def test_link_context_fields_reach_the_observation(tmp_path):
+    articles = {
+        "Start": {"title": "Start", "text": "Full text.", "outgoing": ["Goal", "Other"],
+                  "lead": "Start is an article.", "link_order": ["Other", "Goal"],
+                  "link_context": {"Goal": "Start links to Goal here."}},
+        "Goal": {"title": "Goal", "text": "", "outgoing": ["Start"]},
+        "Other": {"title": "Other", "text": "", "outgoing": ["Start"]},
+    }
+    path = tmp_path / "articles.json"
+    path.write_text(json.dumps(articles), encoding="utf-8")
+    env = WikiGameEnv(path, max_clicks=3)
+    env.reset(options={"start": "Start", "target": "Goal"})
+    observation = env.get_llm_observation()
+    assert observation["lead"] == "Start is an article."
+    assert observation["actions"] == [
+        {"id": 0, "title": "Goal", "position": 1, "context": "Start links to Goal here."},
+        {"id": 1, "title": "Other", "position": 0, "context": None},
+    ]
+    env.step(0)  # Goal has no context fields: the observation has none either.
