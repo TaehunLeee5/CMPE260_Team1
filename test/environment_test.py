@@ -376,3 +376,33 @@ def test_link_context_fields_reach_the_observation(tmp_path):
         {"id": 1, "title": "Other", "position": 0, "context": None},
     ]
     env.step(0)  # Goal has no context fields: the observation has none either.
+
+
+
+def test_self_links_can_be_removed(tmp_path):
+    articles = {"Start": {"title": "Start", "text": "", "outgoing": ["Start", "Goal"]},
+                "Goal": {"title": "Goal", "text": "", "outgoing": ["Start"]}}
+    path = tmp_path / "articles.json"
+    path.write_text(json.dumps(articles), encoding="utf-8")
+    with_self = WikiGameEnv(path, max_clicks=3)
+    without = WikiGameEnv(path, max_clicks=3, self_links=False)
+    assert with_self.articles["Start"]["outgoing"] == ["Start", "Goal"]
+    assert without.articles["Start"]["outgoing"] == ["Goal"]
+    without.reset(options={"start": "Start", "target": "Goal"})
+    assert [a["title"] for a in without.get_llm_observation()["actions"]] == ["Goal"]
+    _, reward, terminated, _, info = without.step(0)
+    assert terminated and info["success"]
+
+
+
+def test_progress_reward_without_self_links(progress_files):
+    """The final setup: the matrix check and progress credit work with self-links removed."""
+    env = WikiGameEnv(progress_files["articles.json"], max_clicks=2, reward="progress", self_links=False,
+                      distance_matrix_path=progress_files["matrix.txt"], article_order_path=progress_files["order.json"])
+    env.reset(options={"start": "Start", "target": "Goal"})
+    titles = [a["title"] for a in env.get_llm_observation()["actions"]]
+    assert "Start" not in titles  # The fixture's self-link is gone.
+    middle = titles.index("Middle")
+    assert env.step(middle)[1] == pytest.approx(0.125)
+    _, reward, terminated, _, info = env.step(0)
+    assert terminated and info["success"] and info["episode_return"] == pytest.approx(1.25)

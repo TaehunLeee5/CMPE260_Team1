@@ -200,7 +200,7 @@ def main():
         parser.error("Output must not overwrite either input file.")
     report = json.loads(args.results.read_text(encoding="utf-8"))
     settings = report["settings"]
-    env = WikiGameEnv(args.articles, max_clicks=settings["max_clicks"])
+    env = WikiGameEnv(args.articles, max_clicks=settings["max_clicks"], self_links=settings.get("self_links", True))
     try:
         states = replay_states(report, env, args.states)
     finally:

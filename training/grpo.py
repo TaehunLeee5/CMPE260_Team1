@@ -371,10 +371,10 @@ DEFAULTS = {
     "val_tasks": "data/processed/final_v2_5000/val.json",
     "articles": "data/processed/articles.json", "distance": [2, 3, 4],
     "tasks_per_batch": 4, "rollouts": 8, "seed": 42, "max_clicks": 20,
-    "max_input_tokens": 4096, "learning_rate": 1e-5, "clip_range": 0.2,
-    "max_grad_norm": 1.0, "val_limit": 100, "eval_every": 10, "min_advantage_std": 0.1,
-    "update_epochs": 2, "activation_checkpointing": True, "val_seed": 42, "reward": "success",
-    "prompt_style": "article_text",
+    "max_input_tokens": 4096, "learning_rate": 3e-5, "clip_range": 0.2,
+    "max_grad_norm": 1.0, "val_limit": 200, "eval_every": 10, "min_advantage_std": 0.1,
+    "update_epochs": 2, "activation_checkpointing": True, "val_seed": 42, "reward": "progress",
+    "prompt_style": "article_text", "self_links": False,
 }
 
 
@@ -498,8 +498,10 @@ def main():
                         help="article_text (default) or link_context (needs --articles "
                              "data/processed/articles_context.json).")
     parser.add_argument("--reward", choices=["success", "progress"],
-                        help='Failed routes earn 0 ("success", default) or partial credit for '
-                             'ending closer to the target ("progress").')
+                        help='"progress" (default): closest-approach credit for failed routes; '
+                             '"success": failed routes earn 0.')
+    parser.add_argument("--self-links", action=argparse.BooleanOptionalAction,
+                        help="Keep each article's link to itself (default: removed, as on real Wikipedia).")
     parser.add_argument("--activation-checkpointing", action=argparse.BooleanOptionalAction,
                         help="Recompute activations during backward to save memory (default: on). "
                              "Off is faster with identical results but needs much more GPU memory.")
@@ -572,8 +574,9 @@ def main():
         return
 
     try:
+        # Runs started before these settings existed keep their original behavior.
         env = WikiGameEnv(config["articles"], max_clicks=config["max_clicks"],
-                          reward=config.get("reward", "success"))
+                          reward=config.get("reward", "success"), self_links=config.get("self_links", True))
     except (ValueError, OSError) as error:
         parser.error(f"Could not create the environment: {error}")
     try:

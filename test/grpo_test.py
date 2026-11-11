@@ -130,8 +130,9 @@ def test_defaults_match_final_training_setup():
     assert grpo.DEFAULTS["min_advantage_std"] == 0.1
     assert grpo.DEFAULTS["update_epochs"] == 2
     assert grpo.DEFAULTS["activation_checkpointing"] is True
-    assert grpo.DEFAULTS["reward"] == "success"  # Existing runs stay reproducible.
-    assert grpo.DEFAULTS["val_limit"] == 100 and grpo.DEFAULTS["eval_every"] == 10
+    assert grpo.DEFAULTS["reward"] == "progress" and grpo.DEFAULTS["self_links"] is False
+    assert grpo.DEFAULTS["learning_rate"] == 3e-5  # Chosen by the learning-rate pilots.
+    assert grpo.DEFAULTS["val_limit"] == 200 and grpo.DEFAULTS["eval_every"] == 10
     assert "final_v2_5000" in grpo.DEFAULTS["tasks"] and "final_v2_5000" in grpo.DEFAULTS["val_tasks"]
 
 

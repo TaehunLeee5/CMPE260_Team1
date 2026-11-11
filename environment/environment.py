@@ -39,8 +39,13 @@ class WikiGameEnv(gym.Env):
     def __init__(self, articles_path="data/processed/articles.json", max_clicks=20,
                  history_size=5, reward="success",
                  distance_matrix_path="data/raw/graph/shortest-path-distance-matrix.txt",
-                 article_order_path="data/processed/article_order.json"):
-        """Create the navigation environment from preprocessed article data."""
+                 article_order_path="data/processed/article_order.json", self_links=True):
+        """Create the navigation environment from preprocessed article data.
+
+        self_links=False drops each article's link to itself, as on real Wikipedia,
+        where a link to the current page is not clickable. Shortest-path distances
+        are unaffected, since a self-link never shortens a path.
+        """
         super().__init__()
         if max_clicks < 1 or history_size < 1:
             raise ValueError("Click budget and history size must be positive.")
@@ -50,6 +55,10 @@ class WikiGameEnv(gym.Env):
             self.articles = json.load(file)
         if not self.articles:
             raise ValueError("The article dataset is empty.")
+        self.self_links = self_links
+        if not self_links:
+            for article_id, article in self.articles.items():
+                article["outgoing"] = [link for link in article["outgoing"] if link != article_id]
 
         self.article_ids = list(self.articles)
         self.article_index = {}

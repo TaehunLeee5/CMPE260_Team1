@@ -160,6 +160,8 @@ def main():
     parser.add_argument("--articles", type=Path, default=Path("data/processed/articles.json"),
                         help="Article data; link_context needs data/processed/articles_context.json.")
     parser.add_argument("--prompt-style", choices=PROMPT_STYLES, default="article_text")
+    parser.add_argument("--self-links", action="store_true",
+                        help="Keep each article's link to itself (default: removed, matching training).")
     parser.add_argument("--uncached-greedy", action="store_true",
                         help="Use the original uncached greedy decoder (reproduces the first baselines).")
     parser.add_argument("--rollouts", type=int, default=1, help="Sampled routes per task (default: 1).")
@@ -204,7 +206,7 @@ def main():
     if args.limit is not None:
         tasks = random.Random(args.seed).sample(tasks, min(args.limit, len(tasks)))
 
-    env = WikiGameEnv(articles_path=args.articles, max_clicks=args.max_clicks)
+    env = WikiGameEnv(articles_path=args.articles, max_clicks=args.max_clicks, self_links=args.self_links)
     try:
         for task in tasks:
             env.validate_pair(task["start"], task["target"])
@@ -231,6 +233,7 @@ def main():
             "enable_thinking": False,
             "use_cache": not args.uncached_greedy,
             "prompt_style": args.prompt_style, "articles": str(args.articles),
+            "self_links": args.self_links,
             "decoder": ("kv_cached_sampling_then_teacher_forced_rescore" if args.sample
                         else "forced_token_skip" if args.uncached_greedy
                         else "kv_cached_greedy_float32_choices"),

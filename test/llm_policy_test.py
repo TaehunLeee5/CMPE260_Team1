@@ -1226,7 +1226,7 @@ def test_grpo_cli_collects_audits_and_reports_update(policy, tmp_path, monkeypat
         args = ["--resume", str(output)] if resume else [
             "--tasks", str(tasks_path), "--val-tasks", str(val_path), "--articles", str(article_path),
             "--distance", "2", "--tasks-per-batch", "1", "--rollouts", "4", "--max-clicks", "2",
-            "--val-limit", "1", "--eval-every", "2", "--output", str(output),
+            "--val-limit", "1", "--eval-every", "2", "--reward", "success", "--output", str(output),
         ]
         monkeypatch.setattr(sys, "argv", ["grpo", *args, "--batches", str(batches), *extra])
         grpo.main()

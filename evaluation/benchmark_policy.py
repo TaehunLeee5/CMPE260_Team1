@@ -175,7 +175,7 @@ def main():
     report = json.loads(args.results.read_text(encoding="utf-8"))
     settings = report["settings"]
     env = WikiGameEnv(args.articles, max_clicks=settings["max_clicks"],
-                      reward=settings.get("reward", "success"))
+                      reward=settings.get("reward", "success"), self_links=settings.get("self_links", True))
     try:
         states = replay_states(report, env, args.states)
     finally:
