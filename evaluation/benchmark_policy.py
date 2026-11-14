@@ -20,7 +20,7 @@ def replay_states(report, env, count):
     """Select states evenly across the saved moves, including the first and last."""
     if count < 1:
         raise ValueError("State count must be positive.")
-    analyze_routes(report, env.articles)
+    analyze_routes(report, env.articles, env.route_return)
     total = sum(episode["clicks"] for episode in report["episodes"])
     count = min(count, total)
     positions = {0} if count == 1 else {i * (total - 1) // (count - 1) for i in range(count)}
@@ -174,7 +174,8 @@ def main():
         parser.error("Output must not overwrite either input file.")
     report = json.loads(args.results.read_text(encoding="utf-8"))
     settings = report["settings"]
-    env = WikiGameEnv(args.articles, max_clicks=settings["max_clicks"])
+    env = WikiGameEnv(args.articles, max_clicks=settings["max_clicks"],
+                      reward=settings.get("reward", "success"), self_links=settings.get("self_links", True))
     try:
         states = replay_states(report, env, args.states)
     finally:

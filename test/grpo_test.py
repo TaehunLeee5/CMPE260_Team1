@@ -130,7 +130,9 @@ def test_defaults_match_final_training_setup():
     assert grpo.DEFAULTS["min_advantage_std"] == 0.1
     assert grpo.DEFAULTS["update_epochs"] == 2
     assert grpo.DEFAULTS["activation_checkpointing"] is True
-    assert grpo.DEFAULTS["val_limit"] == 100 and grpo.DEFAULTS["eval_every"] == 10
+    assert grpo.DEFAULTS["reward"] == "progress" and grpo.DEFAULTS["self_links"] is False
+    assert grpo.DEFAULTS["learning_rate"] == 3e-5  # Chosen by the learning-rate pilots.
+    assert grpo.DEFAULTS["val_limit"] == 200 and grpo.DEFAULTS["eval_every"] == 10
     assert "final_v2_5000" in grpo.DEFAULTS["tasks"] and "final_v2_5000" in grpo.DEFAULTS["val_tasks"]
 
 
@@ -171,3 +173,31 @@ def test_prune_checkpoint_keeps_route_report(tmp_path):
     assert not (first / "adapter").exists() and not (first / "trainer_state.pt").exists()
     assert (first / "report.json").exists()
     assert resolve_resume(run)[1].name == "batch_000002"
+
+
+
+def test_no_revisits_flag_turns_the_rule_on(tmp_path, monkeypatch):
+    """Regression: BooleanOptionalAction parsed --no-revisits as no_revisits=False."""
+    captured = {}
+    real = grpo.WikiGameEnv
+
+    def stop(*args, **kwargs):
+        raise SystemExit("stop")
+
+    train, val = tmp_path / "train.json", tmp_path / "val.json"
+    train.write_text(json.dumps(_tasks({2: 10, 3: 10, 4: 10})), encoding="utf-8")
+    val.write_text(json.dumps([{"start": "v", "target": "w", "shortest_distance": 2}]), encoding="utf-8")
+    original = grpo.argparse.ArgumentParser.parse_args
+
+    def spy(self, *args, **kwargs):
+        namespace = original(self, *args, **kwargs)
+        captured["no_revisits"] = namespace.no_revisits
+        raise SystemExit("parsed")
+
+    monkeypatch.setattr(grpo.argparse.ArgumentParser, "parse_args", spy)
+    for argv, expected in [(["--no-revisits"], True), ([], None)]:
+        monkeypatch.setattr(sys, "argv", ["grpo", "--tasks", str(train), "--val-tasks", str(val),
+                                          "--output", str(tmp_path / "run"), *argv])
+        with pytest.raises(SystemExit):
+            grpo.main()
+        assert captured["no_revisits"] is expected

@@ -290,3 +290,25 @@ def test_benchmark_replays_selected_states(tmp_path, report, articles):
     assert [state["observation"]["current_title"] for state in states] == ["Article A", "Article C", "Article B"]
     assert [state["observation"]["back_available"] for state in states] == [False, True, True]
     assert states[1]["observation"]["navigation_stack"] == ["Article A", "Article C"]
+
+
+
+def progress_reward(path, target, clicks, success):
+    """Stand-in for WikiGameEnv.route_return on this fixture graph (distances to T)."""
+    to_target = {"A": 2, "B": 1, "C": None, "T": 0}
+    total = 1 + 0.1 * (6 - clicks) / 6 if success else 0.0
+    closest = min(to_target[page] for page in path if to_target[page] is not None)
+    return total + 0.25 * (2 - closest) / 2
+
+
+def test_progress_reward_returns_are_audited(articles):
+    report = make_report(["A", "B", "A", "B", "A", "B", "A"],
+                         [follow("Article B"), follow("Article A")] * 3, ["A", "B", "A", "B", "A", "B", "A"])
+    report["settings"]["reward"] = "progress"
+    report["episodes"][0]["episode_return"] = 0.125  # Closest approach: B, one click from T.
+    assert analyze_routes(report, articles, progress_reward)["summary"]["successes"] == 0
+    report["episodes"][0]["episode_return"] = 0.0
+    with pytest.raises(ValueError, match="reward disagrees"):
+        analyze_routes(report, articles, progress_reward)
+    with pytest.raises(ValueError, match="pass reward_fn"):
+        analyze_routes(report, articles)

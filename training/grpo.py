@@ -20,7 +20,7 @@ from environment.environment import WikiGameEnv
 from environment.episode_runner import EpisodeRunner
 from evaluation.audit_saved_routes import analyze_routes
 from evaluation.evaluate import evaluate, summarize_groups
-from policy.llm_policy import WikiGamePolicy
+from policy.llm_policy import PROMPT_STYLES, WikiGamePolicy
 from training.checkpoint import (capture_rng, read_checkpoint, resolve_resume, restore_rng,
                                  restore_training_state, save_checkpoint, write_json)
 
@@ -350,7 +350,7 @@ def grpo_update(policy, groups, optimizer, clip_range=0.2, max_grad_norm=1.0, at
         policy.model.eval()
 
 
-def compact_report(groups, max_clicks):
+def compact_report(groups, max_clicks, reward="success"):
     """Keep audited routes on disk while encoded training inputs stay in memory."""
     episodes = []
     for group in groups:
@@ -361,7 +361,7 @@ def compact_report(groups, max_clicks):
             row["path_efficiency"] = row["shortest_distance"] / row["clicks"] if row["success"] else None
             episodes.append(row)
     group_rows, group_summary = summarize_groups(episodes)
-    return {"settings": {"max_clicks": max_clicks}, "episodes": episodes,
+    return {"settings": {"max_clicks": max_clicks, "reward": reward}, "episodes": episodes,
             "groups": group_rows, "group_summary": group_summary}
 
 
@@ -371,9 +371,10 @@ DEFAULTS = {
     "val_tasks": "data/processed/final_v2_5000/val.json",
     "articles": "data/processed/articles.json", "distance": [2, 3, 4],
     "tasks_per_batch": 4, "rollouts": 8, "seed": 42, "max_clicks": 20,
-    "max_input_tokens": 4096, "learning_rate": 1e-5, "clip_range": 0.2,
-    "max_grad_norm": 1.0, "val_limit": 100, "eval_every": 10, "min_advantage_std": 0.1,
-    "update_epochs": 2, "activation_checkpointing": True, "val_seed": 42,
+    "max_input_tokens": 4096, "learning_rate": 3e-5, "clip_range": 0.2,
+    "max_grad_norm": 1.0, "val_limit": 200, "eval_every": 10, "min_advantage_std": 0.1,
+    "update_epochs": 2, "activation_checkpointing": True, "val_seed": 42, "reward": "progress",
+    "prompt_style": "article_text", "self_links": False, "no_revisits": False,
 }
 
 
@@ -425,8 +426,8 @@ def run_training(runner, optimizer, tasks, val_tasks, output, batches, config, p
         collected_at = perf_counter()
         groups = collect_groups(runner, selected, config["rollouts"], seed=None)
         collection_seconds = perf_counter() - collected_at
-        report = compact_report(groups, runner.env.max_clicks)
-        report["route_audit"] = analyze_routes(report, runner.env.articles)["summary"]
+        report = compact_report(groups, runner.env.max_clicks, runner.env.reward_mode)
+        report["route_audit"] = analyze_routes(report, runner.env.articles, runner.env.route_return)["summary"]
         print("Collected groups:", json.dumps(report["group_summary"]), flush=True)
         should_validate = batch % config["eval_every"] == 0 or batch == batches
         updating_at = perf_counter()
@@ -493,6 +494,17 @@ def main():
         parser.add_argument("--" + flag.replace("_", "-"), type=int, help=f"Default: {DEFAULTS[flag]}")
     for flag in ["learning_rate", "clip_range", "max_grad_norm", "min_advantage_std"]:
         parser.add_argument("--" + flag.replace("_", "-"), type=float, help=f"Default: {DEFAULTS[flag]}")
+    parser.add_argument("--prompt-style", choices=PROMPT_STYLES,
+                        help="article_text (default) or link_context (needs --articles "
+                             "data/processed/articles_context.json).")
+    parser.add_argument("--reward", choices=["success", "progress"],
+                        help='"progress" (default): closest-approach credit for failed routes; '
+                             '"success": failed routes earn 0.')
+    parser.add_argument("--no-revisits", action="store_true", default=None,
+                        help="Never follow a link to an already visited page; go_back stays allowed "
+                             "(default: off).")
+    parser.add_argument("--self-links", action=argparse.BooleanOptionalAction,
+                        help="Keep each article's link to itself (default: removed, as on real Wikipedia).")
     parser.add_argument("--activation-checkpointing", action=argparse.BooleanOptionalAction,
                         help="Recompute activations during backward to save memory (default: on). "
                              "Off is faster with identical results but needs much more GPU memory.")
@@ -564,12 +576,23 @@ def main():
         print(f"Already completed {batches} batches. Use a larger --batches target to continue.")
         return
 
-    env = WikiGameEnv(config["articles"], max_clicks=config["max_clicks"])
+    try:
+        # Runs started before these settings existed keep their original behavior.
+        env = WikiGameEnv(config["articles"], max_clicks=config["max_clicks"],
+                          reward=config.get("reward", "success"), self_links=config.get("self_links", True))
+    except (ValueError, OSError) as error:
+        parser.error(f"Could not create the environment: {error}")
     try:
         for task in tasks + val_tasks:
             env.validate_pair(task["start"], task["target"])
+            # With progress rewards, the matrix must agree with the task splits.
+            if env.reward_mode == "progress" and \
+                    env.shortest_distance(task["start"], task["target"]) != task["shortest_distance"]:
+                raise ValueError("The distance matrix disagrees with a task's shortest_distance.")
         set_seed(config["seed"])
-        policy = WikiGamePolicy(max_input_tokens=config["max_input_tokens"])
+        policy = WikiGamePolicy(max_input_tokens=config["max_input_tokens"],
+                                prompt_style=config.get("prompt_style", "article_text"),
+                                no_revisits=config.get("no_revisits", False))
         if payload:
             policy.model = PeftModel.from_pretrained(policy.model, checkpoint / "adapter",
                                                      is_trainable=True, local_files_only=True)
@@ -606,6 +629,8 @@ def main():
                 choice_logits="float32_output_layer_over_legal_tokens",
                 validation_decoder="kv_cached_greedy_float32_choices",
                 prune_checkpoints=True,
+                progress_reward=("0.25 * (d_start - d_closest) / d_start, paid per new closest approach"
+                                 if config["reward"] == "progress" else None),
                 training_scorer=("replay_of_cached_sampling_computation" if policy.replay_scoring
                                  else "one_teacher_forced_pass_per_step"),
                 loss_normalization="mean_branch_tokens_per_route_then_mean_all_routes",

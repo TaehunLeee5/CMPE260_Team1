@@ -202,7 +202,8 @@ def test_sampled_groups_are_reproducible_and_seeded_once(runner, monkeypatch):
     assert len(result["episodes"]) == 8
     assert all(mode is False for mode in runner.policy.deterministic_calls)
     assert result["settings"] == {
-        "max_clicks": 2, "deterministic": False, "rollouts_per_task": 4, "rollout_seed": 42,
+        "max_clicks": 2, "reward": "success", "deterministic": False, "rollouts_per_task": 4,
+        "rollout_seed": 42,
     }
     varied, failed = result["groups"]
     assert varied["returns"] == pytest.approx([1.05, 1.0, 0.0, 1.05])

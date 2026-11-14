@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import random
+
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
@@ -16,20 +18,47 @@ class WikiGameEnv(gym.Env):
     Both kinds of move consume one click. The full visited route is retained.
     The caller supplies start and target IDs through reset options.
 
-    Intermediate steps and failed episodes receive zero reward. Success earns
-    1 plus 0.1 times the fraction of the click budget remaining.
+    reward="success" (the default): success earns 1 plus 0.1 times the fraction
+    of the click budget remaining; every other reward is zero.
+
+    reward="progress" adds closest-approach credit. Let d be the shortest-path
+    distance to the target and d_closest the smallest d over the pages visited
+    so far. Whenever a move sets a new d_closest, it earns
+    PROGRESS_WEIGHT * (improvement) / d_start, so a route's progress credit
+    totals PROGRESS_WEIGHT * (d_start - d_closest) / d_start. A success reaches
+    d = 0 and therefore earns the full PROGRESS_WEIGHT plus its success reward,
+    so every success (at least 1.25) outranks every failure (below 0.25).
+    Revisits, self-links and backtracks cannot earn credit, and there is no
+    incentive to linger near the target. The agent never observes distances;
+    only the reward uses them.
     """
 
+    PROGRESS_WEIGHT = 0.25
+    CONSISTENCY_SAMPLES = 2000
+
     def __init__(self, articles_path="data/processed/articles.json", max_clicks=20,
-                 history_size=5):
-        """Create the navigation environment from preprocessed article data."""
+                 history_size=5, reward="success",
+                 distance_matrix_path="data/raw/graph/shortest-path-distance-matrix.txt",
+                 article_order_path="data/processed/article_order.json", self_links=True):
+        """Create the navigation environment from preprocessed article data.
+
+        self_links=False drops each article's link to itself, as on real Wikipedia,
+        where a link to the current page is not clickable. Shortest-path distances
+        are unaffected, since a self-link never shortens a path.
+        """
         super().__init__()
         if max_clicks < 1 or history_size < 1:
             raise ValueError("Click budget and history size must be positive.")
+        if reward not in ("success", "progress"):
+            raise ValueError('reward must be "success" or "progress".')
         with Path(articles_path).open(encoding="utf-8") as file:
             self.articles = json.load(file)
         if not self.articles:
             raise ValueError("The article dataset is empty.")
+        self.self_links = self_links
+        if not self_links:
+            for article_id, article in self.articles.items():
+                article["outgoing"] = [link for link in article["outgoing"] if link != article_id]
 
         self.article_ids = list(self.articles)
         self.article_index = {}
@@ -59,6 +88,65 @@ class WikiGameEnv(gym.Env):
         self.current = None
         self.target = None
         self.done = True
+        self.reward_mode = reward
+        self.distances = None
+        if reward == "progress":
+            self.distances = self._load_distances(Path(distance_matrix_path), Path(article_order_path))
+
+    def _load_distances(self, matrix_path, order_path):
+        """Load the shortest-path matrix, checking it is aligned with articles.json."""
+        with order_path.open(encoding="utf-8") as file:
+            order = json.load(file)
+        if order != self.article_ids:
+            raise ValueError("article_order.json does not match the article order of articles.json.")
+        with matrix_path.open(encoding="utf-8-sig") as file:
+            rows = [line.strip() for line in file if line.strip() and not line.lstrip().startswith("#")]
+        size = len(self.article_ids)
+        if len(rows) != size:
+            raise ValueError("The distance matrix has the wrong number of rows.")
+        for index, row in enumerate(rows):
+            if len(row) != size or set(row) - set("0123456789_") or row[index] != "0":
+                raise ValueError(f"Invalid distance matrix row: {index}")
+        self._check_distances(rows)
+        return rows
+
+    def _check_distances(self, rows):
+        """Check that sampled distances satisfy d(s, t) = 1 + min over links of d(n, t).
+
+        This confirms the matrix describes this environment's link graph, not
+        merely that the task distances match. All pairs are checked for small graphs.
+        """
+        size = len(self.article_ids)
+        pairs = [(s, t) for s in range(size) for t in range(size) if s != t]
+        if len(pairs) > self.CONSISTENCY_SAMPLES:
+            rng = random.Random(0)
+            pairs = [(rng.randrange(size), rng.randrange(size)) for _ in range(self.CONSISTENCY_SAMPLES)]
+            pairs = [(s, t) for s, t in pairs if s != t]
+        for s, t in pairs:
+            links = [self.article_index[n] for n in self.articles[self.article_ids[s]]["outgoing"]]
+            reachable = [int(rows[n][t]) for n in links if rows[n][t] != "_"]
+            expected = 1 + min(reachable) if reachable else None
+            actual = None if rows[s][t] == "_" else int(rows[s][t])
+            if actual != expected:
+                raise ValueError(
+                    f"The distance matrix does not match the link graph: "
+                    f"{self.article_ids[s]} -> {self.article_ids[t]} is {actual}, links imply {expected}.")
+
+    def shortest_distance(self, source, target):
+        """Shortest-path clicks from source to target, or None if unreachable."""
+        if self.distances is None:
+            raise ValueError('Distances are only loaded with reward="progress".')
+        value = self.distances[self.article_index[source]][self.article_index[target]]
+        return None if value == "_" else int(value)
+
+    def route_return(self, path, target, clicks, success):
+        """A whole route's return; route audits recompute every episode with this."""
+        total = 1.0 + 0.1 * (self.max_clicks - clicks) / self.max_clicks if success else 0.0
+        if self.reward_mode == "progress":
+            initial = self.shortest_distance(path[0], target)
+            reached = [d for d in (self.shortest_distance(page, target) for page in path) if d is not None]
+            total += self.PROGRESS_WEIGHT * (initial - min(reached)) / initial
+        return total
 
     def validate_pair(self, start, target):
         """Check explicit article IDs; reachability must be checked when making task splits."""
@@ -86,6 +174,10 @@ class WikiGameEnv(gym.Env):
         self.navigation_stack = [start]
         self.clicks = 0
         self.episode_return = 0.0
+        if self.reward_mode == "progress":
+            self.start_distance = self.closest_distance = self.shortest_distance(start, target)
+            if self.start_distance is None:
+                raise ValueError("The target is unreachable from the start article.")
         self.reason = ""
         self.done = False
         return self.get_observation(), self.get_info()
@@ -126,10 +218,17 @@ class WikiGameEnv(gym.Env):
             raise gym.error.ResetNeeded("Call reset() before requesting an observation.")
         actions = []
         back_available = not self.done and len(self.navigation_stack) > 1
+        page = self.articles[self.current]
+        has_context = "link_order" in page  # Added by data/link_context.py.
+        positions = {link: i for i, link in enumerate(page.get("link_order", []))}
         if not self.done:
-            for index, article_id in enumerate(self.articles[self.current]["outgoing"]):
-                actions.append({"id": index, "title": self.articles[article_id]["title"]})
-        return {
+            for index, article_id in enumerate(page["outgoing"]):
+                action = {"id": index, "title": self.articles[article_id]["title"]}
+                if has_context:
+                    action["position"] = positions.get(article_id)
+                    action["context"] = page["link_context"].get(article_id)
+                actions.append(action)
+        observation = {
             "current_title": self.articles[self.current]["title"],
             "target_title": self.articles[self.target]["title"],
             "text": self.articles[self.current]["text"],
@@ -143,6 +242,9 @@ class WikiGameEnv(gym.Env):
             "back_action_id": self.back_action if back_available else None,
             "remaining_clicks": self.max_clicks - self.clicks,
         }
+        if has_context:
+            observation["lead"] = page.get("lead")
+        return observation
 
     def get_info(self):
         """Return episode metrics and the visited route for debugging and evaluation."""
@@ -160,9 +262,10 @@ class WikiGameEnv(gym.Env):
     def step(self, action):
         """Follow a link or go back, charging one click and retaining the full route.
 
-        Success earns 1 + 0.1 * remaining_clicks / max_clicks. All other
-        rewards are zero. Return observation, reward, terminated, truncated,
-        and info.
+        Success earns 1 + 0.1 * remaining_clicks / max_clicks. With
+        reward="progress", a move that sets a new closest distance to the target
+        also earns its share of progress credit; see the class docstring.
+        Return observation, reward, terminated, truncated, and info.
         """
         if self.done:
             raise gym.error.ResetNeeded("Call reset() before starting or continuing an episode.")
@@ -183,6 +286,11 @@ class WikiGameEnv(gym.Env):
                 self.current = links[action]
                 self.navigation_stack.append(self.current)
             self.history.append(self.current)
+            if self.reward_mode == "progress":
+                distance = self.shortest_distance(self.current, self.target)
+                if distance is not None and distance < self.closest_distance:
+                    reward += self.PROGRESS_WEIGHT * (self.closest_distance - distance) / self.start_distance
+                    self.closest_distance = distance
             if self.current == self.target:
                 self.reason = "success"
             elif self.clicks >= self.max_clicks:
@@ -190,7 +298,6 @@ class WikiGameEnv(gym.Env):
 
         self.done = bool(self.reason)
         if self.reason == "success":
-            remaining_fraction = (self.max_clicks - self.clicks) / self.max_clicks
-            reward = 1.0 + 0.1 * remaining_fraction
+            reward += 1.0 + 0.1 * (self.max_clicks - self.clicks) / self.max_clicks
         self.episode_return += reward
         return self.get_observation(), reward, self.done, False, self.get_info()
