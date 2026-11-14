@@ -173,3 +173,31 @@ def test_prune_checkpoint_keeps_route_report(tmp_path):
     assert not (first / "adapter").exists() and not (first / "trainer_state.pt").exists()
     assert (first / "report.json").exists()
     assert resolve_resume(run)[1].name == "batch_000002"
+
+
+
+def test_no_revisits_flag_turns_the_rule_on(tmp_path, monkeypatch):
+    """Regression: BooleanOptionalAction parsed --no-revisits as no_revisits=False."""
+    captured = {}
+    real = grpo.WikiGameEnv
+
+    def stop(*args, **kwargs):
+        raise SystemExit("stop")
+
+    train, val = tmp_path / "train.json", tmp_path / "val.json"
+    train.write_text(json.dumps(_tasks({2: 10, 3: 10, 4: 10})), encoding="utf-8")
+    val.write_text(json.dumps([{"start": "v", "target": "w", "shortest_distance": 2}]), encoding="utf-8")
+    original = grpo.argparse.ArgumentParser.parse_args
+
+    def spy(self, *args, **kwargs):
+        namespace = original(self, *args, **kwargs)
+        captured["no_revisits"] = namespace.no_revisits
+        raise SystemExit("parsed")
+
+    monkeypatch.setattr(grpo.argparse.ArgumentParser, "parse_args", spy)
+    for argv, expected in [(["--no-revisits"], True), ([], None)]:
+        monkeypatch.setattr(sys, "argv", ["grpo", "--tasks", str(train), "--val-tasks", str(val),
+                                          "--output", str(tmp_path / "run"), *argv])
+        with pytest.raises(SystemExit):
+            grpo.main()
+        assert captured["no_revisits"] is expected

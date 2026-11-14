@@ -5,8 +5,8 @@ import torch
 from peft import LoraConfig, PeftModel, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from policy.prompt import (LINK_CONTEXT_SYSTEM_PROMPT, LINK_CONTEXT_TEMPLATE, OBSERVATION_TEMPLATE,
-                           SYSTEM_PROMPT, TOOLS)
+from policy.prompt import (LINK_CONTEXT_SYSTEM_PROMPT, LINK_CONTEXT_TEMPLATE, NO_REVISIT_LINE,
+                           OBSERVATION_TEMPLATE, SYSTEM_PROMPT, TOOLS, VISITED_LINE)
 
 
 PROMPT_STYLES = ("article_text", "link_context")
@@ -18,13 +18,21 @@ class WikiGamePolicy:
     PROMPT_STYLES = PROMPT_STYLES
 
     def __init__(self, model_name="Qwen/Qwen3-1.7B", max_input_tokens=4096,
-                 *, model=None, tokenizer=None, adapter_path=None, prompt_style="article_text"):
+                 *, model=None, tokenizer=None, adapter_path=None, prompt_style="article_text",
+                 no_revisits=False):
         """Load the actor or injected model, optionally adding a frozen local adapter.
 
         prompt_style="article_text" shows the current article's text (truncated to
         fit); "link_context" shows its opening paragraph and each link with the
         sentence it appears in, which needs articles processed by data/link_context.py.
+
+        no_revisits=True never follows a link to a page already on the visited
+        route; go_back stays available. If every link is visited and there is no
+        way back, visited links are allowed again (recorded as revisit_fallback).
+        Going back cannot loop: the page just left is visited, so it cannot be
+        clicked again, and the navigation stack runs out.
         """
+        self._last_revisit_fallback = False
         if max_input_tokens is not None and max_input_tokens < 1:
             raise ValueError("The input token budget must be positive.")
         if prompt_style not in self.PROMPT_STYLES:
@@ -34,6 +42,7 @@ class WikiGamePolicy:
             self.system_prompt, self.observation_template = LINK_CONTEXT_SYSTEM_PROMPT, LINK_CONTEXT_TEMPLATE
         else:
             self.system_prompt, self.observation_template = SYSTEM_PROMPT, OBSERVATION_TEMPLATE
+        self.no_revisits = no_revisits  # Also adjusts the system prompt; see the property.
         self.max_input_tokens = max_input_tokens
         # When True, training scores a sampled call by replaying the exact cached
         # computation it was sampled with (needs activation checkpointing off).
@@ -121,6 +130,19 @@ class WikiGamePolicy:
         )
         return self.observation_template.format(**values)
 
+    @property
+    def no_revisits(self):
+        return self._no_revisits
+
+    @no_revisits.setter
+    def no_revisits(self, value):
+        """Switch the rule; the system prompt always states the rule in force."""
+        self._no_revisits = bool(value)
+        base = LINK_CONTEXT_SYSTEM_PROMPT if self.prompt_style == "link_context" else SYSTEM_PROMPT
+        if VISITED_LINE not in base:
+            raise ValueError("The system prompt no longer contains the visited-links line.")
+        self.system_prompt = base.replace(VISITED_LINE, NO_REVISIT_LINE) if self._no_revisits else base
+
     def _page_order(self, actions):
         """Links in the order they appear on the page; links not shown on it go last, alphabetically."""
         return sorted(actions, key=lambda a: (a.get("position") is None, a.get("position") or 0,
@@ -148,6 +170,15 @@ class WikiGamePolicy:
             calls[ident] = {"name": "go_back", "arguments": {}}
         if not calls:
             raise ValueError("The observation has no available actions.")
+        self._last_revisit_fallback = False
+        if self.no_revisits:
+            visited = set(observation["history"])
+            allowed = {ident: call for ident, call in calls.items()
+                       if call["name"] == "go_back" or call["arguments"]["title"] not in visited}
+            if allowed:
+                calls = allowed
+            else:
+                self._last_revisit_fallback = True  # Cornered: every link visited, no way back.
         return calls
 
     def _action_sequences(self, calls):
@@ -382,6 +413,7 @@ class WikiGamePolicy:
                 "sampling_max_abs_error": max(errors, default=0.0),
                 # Entropy of each decision's legal-token distribution, in nats.
                 "decision_entropies": self._last_entropies,
+                "revisit_fallback": self._last_revisit_fallback,
             }
         tokens, token_choices, scores = [], [], []
         for _ in range(max(map(len, sequences.values()))):
@@ -409,6 +441,7 @@ class WikiGamePolicy:
             "token_ids": tokens, "token_choices": token_choices,
             "token_log_probs": scores,
             "log_prob": torch.tensor(scores, device=self.model.device, dtype=torch.float32).sum().item(),
+            "revisit_fallback": self._last_revisit_fallback,
         }
 
     def _step_log_probs(self, prompt_ids, token_ids, token_choices):

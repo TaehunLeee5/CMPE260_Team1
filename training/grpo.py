@@ -374,7 +374,7 @@ DEFAULTS = {
     "max_input_tokens": 4096, "learning_rate": 3e-5, "clip_range": 0.2,
     "max_grad_norm": 1.0, "val_limit": 200, "eval_every": 10, "min_advantage_std": 0.1,
     "update_epochs": 2, "activation_checkpointing": True, "val_seed": 42, "reward": "progress",
-    "prompt_style": "article_text", "self_links": False,
+    "prompt_style": "article_text", "self_links": False, "no_revisits": False,
 }
 
 
@@ -500,6 +500,9 @@ def main():
     parser.add_argument("--reward", choices=["success", "progress"],
                         help='"progress" (default): closest-approach credit for failed routes; '
                              '"success": failed routes earn 0.')
+    parser.add_argument("--no-revisits", action="store_true", default=None,
+                        help="Never follow a link to an already visited page; go_back stays allowed "
+                             "(default: off).")
     parser.add_argument("--self-links", action=argparse.BooleanOptionalAction,
                         help="Keep each article's link to itself (default: removed, as on real Wikipedia).")
     parser.add_argument("--activation-checkpointing", action=argparse.BooleanOptionalAction,
@@ -588,7 +591,8 @@ def main():
                 raise ValueError("The distance matrix disagrees with a task's shortest_distance.")
         set_seed(config["seed"])
         policy = WikiGamePolicy(max_input_tokens=config["max_input_tokens"],
-                                prompt_style=config.get("prompt_style", "article_text"))
+                                prompt_style=config.get("prompt_style", "article_text"),
+                                no_revisits=config.get("no_revisits", False))
         if payload:
             policy.model = PeftModel.from_pretrained(policy.model, checkpoint / "adapter",
                                                      is_trainable=True, local_files_only=True)

@@ -74,3 +74,10 @@ About the current article:
 
 Available links:
 {links}"""
+
+
+# With no_revisits, the instructions describe the actual rule: visited links stay
+# listed (tagged) but cannot be chosen, and go_back is the way to return.
+VISITED_LINE = "Links marked (visited) or (current page) lead to articles already on your route."
+NO_REVISIT_LINE = ("Links marked (visited) lead to articles already on your route and cannot be followed again;\n"
+                   "use go_back to return to the previous page.")

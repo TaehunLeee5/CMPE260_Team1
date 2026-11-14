@@ -1163,6 +1163,66 @@ def test_link_context_decisions_are_unchanged_in_kind(policy, observation):
     assert actor._tool_calls(observation)[100] == {"name": "follow_link", "arguments": {"title": "France"}}
 
 
+def no_revisit_actor(policy):
+    return WikiGamePolicy(model=policy.model, tokenizer=policy.tokenizer, no_revisits=True)
+
+
+def test_no_revisits_prompt_states_the_rule(policy, observation):
+    actor = no_revisit_actor(policy)
+    assert "cannot be followed again" in actor.system_prompt and "use go_back" in actor.system_prompt
+    assert "cannot be followed again" not in policy.system_prompt  # Default prompt unchanged.
+    full_prompt = policy.tokenizer.decode(actor._encode_observation(observation)["input_ids"][0])
+    assert "cannot be followed again" in full_prompt  # It reaches the model through the chat template.
+    actor.no_revisits = False  # Switching the rule off restores the original prompt exactly.
+    assert actor.system_prompt == policy.system_prompt
+    context = WikiGamePolicy(model=policy.model, tokenizer=policy.tokenizer, prompt_style="link_context",
+                             no_revisits=True)
+    assert "cannot be followed again" in context.system_prompt and "in page order" in context.system_prompt
+
+
+def test_no_revisits_removes_visited_links_but_keeps_go_back(policy, observation):
+    observation["history"] = ["Earth", "Spain", "Europe"]
+    actor = no_revisit_actor(policy)
+    calls = actor._tool_calls(observation)
+    assert {c["arguments"].get("title", c["name"]) for c in calls.values()} == {"Germany", "Italy", "France", "go_back"}
+    assert actor._last_revisit_fallback is False
+    assert len(policy._tool_calls(observation)) == 5  # Off by default: Spain stays allowed.
+
+
+def test_no_revisits_when_every_link_is_visited(policy, observation):
+    actor = no_revisit_actor(policy)
+    observation["history"] = ["Earth", "Germany", "Italy", "Spain", "France", "Europe"]
+    assert [c["name"] for c in actor._tool_calls(observation).values()] == ["go_back"]  # Back is the way out.
+    assert actor._last_revisit_fallback is False
+    observation["back_available"] = False  # Cornered: links are allowed again, and this is recorded.
+    calls = actor._tool_calls(observation)
+    assert len(calls) == 4 and actor._last_revisit_fallback is True
+    decision = actor.choose_action(observation, deterministic=True)
+    assert decision["revisit_fallback"] is True
+
+
+@pytest.mark.parametrize("deterministic", [True, False])
+def test_no_revisits_decisions_never_pick_a_visited_link(policy, observation, deterministic):
+    observation["history"] = ["Earth", "Germany", "Spain", "Europe"]
+    actor = no_revisit_actor(policy)
+    for _ in range(1 if deterministic else 20):
+        decision = actor.choose_action(observation, deterministic=deterministic)
+        assert decision["tool_call"].get("arguments", {}).get("title") not in {"Germany", "Spain"}
+        assert decision["revisit_fallback"] is False
+        assert_decision(actor, observation, decision)  # Recorded choices match the restricted set.
+
+
+def test_no_revisits_trains_with_exact_probabilities(policy, observation, monkeypatch):
+    actor = lora_actor(policy)
+    actor.no_revisits = True
+    observation["history"] = ["Earth", "Italy", "Europe"]  # Italy is excluded; the helper uses Spain and back.
+    group = controlled_grpo_group(actor, observation, monkeypatch)
+    assert all(len(step["token_choices"]) for e in group for step in e["steps"])
+    optimizer = torch.optim.AdamW((p for p in actor.model.parameters() if p.requires_grad), lr=1e-4)
+    result = grpo_update(actor, [group], optimizer, max_grad_norm=1e9, atol=1e-5, update_epochs=2)
+    assert result["optimizer_steps"] == 2 and result["max_initial_token_log_prob_error"] <= 1e-5
+
+
 def test_grpo_skips_constant_reward_groups(policy, observation, monkeypatch):
     actor = WikiGamePolicy(model=deepcopy(policy.model), tokenizer=policy.tokenizer)
     actor.enable_lora()

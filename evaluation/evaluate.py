@@ -75,6 +75,7 @@ def evaluate(runner, tasks, *, deterministic=True, rollouts=1, seed=42):
                     "truncated": episode["truncated"],
                     "shortest_distance": task["shortest_distance"],
                     "path_efficiency": None,
+                    "revisit_fallbacks": sum(bool(step.get("revisit_fallback")) for step in episode["steps"]),
                 }
                 if result["success"]:
                     if result["clicks"] < task["shortest_distance"]:
@@ -104,6 +105,8 @@ def evaluate(runner, tasks, *, deterministic=True, rollouts=1, seed=42):
     }
     report = {
         "summary": summary, "episodes": results,
+        # Steps where no_revisits had to allow visited links (every link visited, no way back).
+        "revisit_fallback_steps": sum(result["revisit_fallbacks"] for result in results),
         "settings": {
             "max_clicks": runner.env.max_clicks, "reward": runner.env.reward_mode,
             "deterministic": deterministic,
@@ -160,6 +163,8 @@ def main():
     parser.add_argument("--articles", type=Path, default=Path("data/processed/articles.json"),
                         help="Article data; link_context needs data/processed/articles_context.json.")
     parser.add_argument("--prompt-style", choices=PROMPT_STYLES, default="article_text")
+    parser.add_argument("--no-revisits", action="store_true",
+                        help="Never follow a link to an already visited page (go_back stays allowed).")
     parser.add_argument("--self-links", action="store_true",
                         help="Keep each article's link to itself (default: removed, matching training).")
     parser.add_argument("--uncached-greedy", action="store_true",
@@ -214,7 +219,7 @@ def main():
         if args.uncached_greedy and args.sample:
             parser.error("--uncached-greedy applies to greedy evaluation only.")
         policy = WikiGamePolicy(max_input_tokens=4096, adapter_path=args.adapter,
-                                prompt_style=args.prompt_style)
+                                prompt_style=args.prompt_style, no_revisits=args.no_revisits)
         policy.cached_greedy = not args.uncached_greedy
         runner = EpisodeRunner(env, policy)
         report = evaluate(
@@ -233,7 +238,7 @@ def main():
             "enable_thinking": False,
             "use_cache": not args.uncached_greedy,
             "prompt_style": args.prompt_style, "articles": str(args.articles),
-            "self_links": args.self_links,
+            "self_links": args.self_links, "no_revisits": args.no_revisits,
             "decoder": ("kv_cached_sampling_then_teacher_forced_rescore" if args.sample
                         else "forced_token_skip" if args.uncached_greedy
                         else "kv_cached_greedy_float32_choices"),
