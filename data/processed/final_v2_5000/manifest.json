@@ -1,0 +1,149 @@
+{
+  "seed": 42,
+  "num_tasks": 5000,
+  "article_count": 4604,
+  "excluded_previous_pair_count": 5010,
+  "excluded_total_pair_count": 5229,
+  "previous_split_files": [
+    {
+      "path": "data/processed/train.json",
+      "task_count": 80,
+      "sha256": "93578b9cafe80e6e39f7627cd78271e74bd52c5adea303e1c37f4a9f421dafdc"
+    },
+    {
+      "path": "data/processed/val.json",
+      "task_count": 10,
+      "sha256": "75531fa87a1c0b79c4dc5de15efc3315c7d61970d7c8fc6da01c96701aa916a1"
+    },
+    {
+      "path": "data/processed/test.json",
+      "task_count": 10,
+      "sha256": "dc34c95a918f482b5ae593aad153998166fc82fad665094e604484c8a16c4761"
+    },
+    {
+      "path": "data/processed/final_5000/train.json",
+      "task_count": 4000,
+      "sha256": "9c703a125190fe224d0443696e4b2aef165d70ec5f137e56f3ec12d35408fa0f"
+    },
+    {
+      "path": "data/processed/final_5000/val.json",
+      "task_count": 500,
+      "sha256": "c5cb42d10b3798337813c6a0ab7d2e3eae1ff32344f37a26a9b2bc0ea1ba79a4"
+    },
+    {
+      "path": "data/processed/final_5000/test.json",
+      "task_count": 500,
+      "sha256": "227245c9bafde569555942d6adac883af64a9613d0b4a04c632a481072ce9560"
+    }
+  ],
+  "debug_report_files": [
+    {
+      "path": "evaluation/results/baseline.json",
+      "recovered_pair_count": 114,
+      "sha256": "c76ea01e97dbe9ac1e9bc093ae9eaddfbbcbc38ab2d2d04879902232a13d9aa4"
+    },
+    {
+      "path": "evaluation/results/baseline_colon_4096.json",
+      "recovered_pair_count": 128,
+      "sha256": "fbd7fbcbe69833d1bb93a44e11cc4e2a0788f41645da19ad17133400a9f6d802"
+    },
+    {
+      "path": "evaluation/results/policy_audit.json",
+      "recovered_pair_count": 6,
+      "sha256": "d77b224a50a42bbbd82257852a4a53c0261b38ee4295b86a04ea571e93496db9"
+    },
+    {
+      "path": "evaluation/results/policy_audit_colon.json",
+      "recovered_pair_count": 6,
+      "sha256": "e02bb0564c5a96a07e0a48c80d21b87f616c7b3d36d5ad1381413c6f77e29823"
+    },
+    {
+      "path": "evaluation/results/policy_decoding_probe.json",
+      "recovered_pair_count": 6,
+      "sha256": "e780b3eba35a94434fbe8b4f00cdb017ddb60606f98f1e0c9526407e98847daa"
+    }
+  ],
+  "graph_folder": "data/raw/graph",
+  "article_order": "data/processed/article_order.json",
+  "article_order_sha256": "2671450f2dbf1daa1e84f03309222be99fb56db71f1e264fb132264999ef7f68",
+  "distance_matrix_sha256": "fab1bff251cbf4606ffd62fdaff4e49783ac6accc3e6074f6fa47a97fdc14f2f",
+  "reachable_pairs": 18588235,
+  "excluded_reachable_pairs": 5229,
+  "eligible_pairs": 18583006,
+  "splits": {
+    "train": {
+      "file": "train.json",
+      "count": 4000,
+      "sha256": "035354f90cc75d3de13b213cc3a28a3a640bad194ec82b883f74848b0cb62c7b",
+      "shortest_distance_histogram": {
+        "1": 23,
+        "2": 635,
+        "3": 2095,
+        "4": 1030,
+        "5": 191,
+        "6": 23,
+        "7": 2,
+        "8": 1
+      }
+    },
+    "val": {
+      "file": "val.json",
+      "count": 500,
+      "sha256": "5002fcfc95f1304448c28f709ba797588acc8ce31f641b45a2d7f7f7bb4cd06c",
+      "shortest_distance_histogram": {
+        "2": 70,
+        "3": 263,
+        "4": 127,
+        "5": 36,
+        "6": 4
+      }
+    },
+    "test": {
+      "file": "test.json",
+      "count": 500,
+      "sha256": "38c839699c3acdf69c0c46ef7e4451b7a72c438778f129785872d87493356f4f",
+      "shortest_distance_histogram": {
+        "1": 4,
+        "2": 82,
+        "3": 258,
+        "4": 128,
+        "5": 25,
+        "6": 3
+      }
+    },
+    "train_pilot": {
+      "file": "train_pilot_800.json",
+      "count": 800,
+      "sha256": "5f5baca238869165100b133da3de261c7ee2538595c14ac1f813d538aedc29a4",
+      "shortest_distance_histogram": {
+        "1": 6,
+        "2": 121,
+        "3": 419,
+        "4": 212,
+        "5": 34,
+        "6": 7,
+        "7": 1
+      }
+    },
+    "val_pilot": {
+      "file": "val_pilot_100.json",
+      "count": 100,
+      "sha256": "c812fb34d22809893388d7b41dfd74aca4b68c76723271b847cb0071e67f997d",
+      "shortest_distance_histogram": {
+        "2": 12,
+        "3": 45,
+        "4": 28,
+        "5": 13,
+        "6": 2
+      }
+    }
+  },
+  "checks": {
+    "full_splits_pair_disjoint": true,
+    "previous_pairs_excluded": true,
+    "pilot_train_is_training_subset": true,
+    "pilot_val_is_validation_subset": true
+  },
+  "split_policy": "Unique reachable ordered start-target pairs, uniform rejection sampling; 80/10/10 split.",
+  "pilot_policy": "Pilot subsets intentionally overlap ONLY their own full train/validation split."
+}

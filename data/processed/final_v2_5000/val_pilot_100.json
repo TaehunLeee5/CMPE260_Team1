@@ -1,0 +1,502 @@
+[
+  {
+    "start": "Fort_de_Chartres",
+    "target": "Idolatry",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Budapest",
+    "target": "Indian_Standard_Time",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Roman_Vishniac",
+    "target": "Arthropod",
+    "shortest_distance": 2
+  },
+  {
+    "start": "Marvin_Gaye",
+    "target": "Shenzhou_6",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Hip_hop_music",
+    "target": "Lake_Chad",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Saxophone",
+    "target": "Henry_V_of_England",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Canola",
+    "target": "Library_of_Alexandria",
+    "shortest_distance": 4
+  },
+  {
+    "start": "African_Buffalo",
+    "target": "Limerick",
+    "shortest_distance": 4
+  },
+  {
+    "start": "Elizabeth_II_of_the_United_Kingdom",
+    "target": "Civil_rights",
+    "shortest_distance": 2
+  },
+  {
+    "start": "Computational_chemistry",
+    "target": "Chess",
+    "shortest_distance": 2
+  },
+  {
+    "start": "Nadia_Com%C4%83neci",
+    "target": "Markup_language",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Pel%C3%A9",
+    "target": "Water_resources",
+    "shortest_distance": 4
+  },
+  {
+    "start": "Cocos_%28Keeling%29_Islands",
+    "target": "Californium",
+    "shortest_distance": 4
+  },
+  {
+    "start": "Carolus_Linnaeus",
+    "target": "M6_motorway",
+    "shortest_distance": 4
+  },
+  {
+    "start": "Hurricane_Edouard_%281996%29",
+    "target": "Fyodor_Dostoevsky",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Allegory_in_the_Middle_Ages",
+    "target": "List_of_Prime_Ministers_of_the_United_Kingdom",
+    "shortest_distance": 4
+  },
+  {
+    "start": "Treecreeper",
+    "target": "The_Lion%2C_the_Witch_and_the_Wardrobe",
+    "shortest_distance": 4
+  },
+  {
+    "start": "Mercia",
+    "target": "Jersey_Zoological_Park",
+    "shortest_distance": 4
+  },
+  {
+    "start": "World_Trade_Organization",
+    "target": "Ghost_Dance",
+    "shortest_distance": 4
+  },
+  {
+    "start": "Prime_number",
+    "target": "Red_rain_in_Kerala",
+    "shortest_distance": 4
+  },
+  {
+    "start": "FairTax",
+    "target": "Scooby-Doo",
+    "shortest_distance": 4
+  },
+  {
+    "start": "Krypton",
+    "target": "David_Cameron",
+    "shortest_distance": 4
+  },
+  {
+    "start": "Augustine_of_Hippo",
+    "target": "History_of_Earth",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Graniteville_train_disaster",
+    "target": "Odysseus",
+    "shortest_distance": 4
+  },
+  {
+    "start": "Petroleum",
+    "target": "F-35_Lightning_II",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Wild_cat",
+    "target": "Hymenoptera",
+    "shortest_distance": 3
+  },
+  {
+    "start": "The_Waste_Land",
+    "target": "Comet_Hyakutake",
+    "shortest_distance": 5
+  },
+  {
+    "start": "Arab-Israeli_conflict",
+    "target": "Microscope",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Federal_Bureau_of_Investigation",
+    "target": "Mythology",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Worm",
+    "target": "Clone_Wars_%28Star_Wars%29",
+    "shortest_distance": 5
+  },
+  {
+    "start": "Electric_field",
+    "target": "Selena",
+    "shortest_distance": 6
+  },
+  {
+    "start": "Cross_Fell",
+    "target": "Parthenon",
+    "shortest_distance": 3
+  },
+  {
+    "start": "CPU_cache",
+    "target": "The_X-Files",
+    "shortest_distance": 5
+  },
+  {
+    "start": "Sucre",
+    "target": "Benin",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Senate_of_Canada",
+    "target": "Panama_Canal",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Outer_Hebrides",
+    "target": "Separation_of_powers_under_the_United_States_Constitution",
+    "shortest_distance": 4
+  },
+  {
+    "start": "Henry_I_of_England",
+    "target": "Government",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Naked_Mole_Rat",
+    "target": "Louis_Pasteur",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Russian_Revolution_of_1917",
+    "target": "Jackie_Robinson",
+    "shortest_distance": 4
+  },
+  {
+    "start": "Emanuel_Swedenborg",
+    "target": "John_Bull_%28locomotive%29",
+    "shortest_distance": 5
+  },
+  {
+    "start": "Cross_Fell",
+    "target": "Starship_Troopers",
+    "shortest_distance": 5
+  },
+  {
+    "start": "Ibn_Battuta",
+    "target": "African_Darter",
+    "shortest_distance": 5
+  },
+  {
+    "start": "BBC",
+    "target": "Day",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Seinfeld",
+    "target": "Laurent_Fignon",
+    "shortest_distance": 4
+  },
+  {
+    "start": "Milan",
+    "target": "Arthur_Sullivan",
+    "shortest_distance": 2
+  },
+  {
+    "start": "Anton%C3%ADn_Dvo%C5%99%C3%A1k",
+    "target": "Spring_%28season%29",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Johann_Wolfgang_Goethe",
+    "target": "Scheme_programming_language",
+    "shortest_distance": 4
+  },
+  {
+    "start": "Gunpowder",
+    "target": "Oroonoko",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Walrus",
+    "target": "Willem_Barents",
+    "shortest_distance": 2
+  },
+  {
+    "start": "Andromeda_Galaxy",
+    "target": "Pope_Benedict_XVI",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Florida_East_Coast_Railway",
+    "target": "Robert_Boyle",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Las_Palmas_de_Gran_Canaria",
+    "target": "Social_capital",
+    "shortest_distance": 4
+  },
+  {
+    "start": "Logic",
+    "target": "Wikispecies",
+    "shortest_distance": 6
+  },
+  {
+    "start": "Bahrain",
+    "target": "Isaac_Newton",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Hebrides",
+    "target": "Continental_crust",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Unix",
+    "target": "Computational_chemistry",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Midway_Atoll",
+    "target": "African_Darter",
+    "shortest_distance": 5
+  },
+  {
+    "start": "Ivory-billed_Woodpecker",
+    "target": "Klinefelter%27s_syndrome",
+    "shortest_distance": 5
+  },
+  {
+    "start": "Music_of_Thailand",
+    "target": "Olmec",
+    "shortest_distance": 2
+  },
+  {
+    "start": "Edmond_Halley",
+    "target": "Arts_and_crafts",
+    "shortest_distance": 4
+  },
+  {
+    "start": "Space_station",
+    "target": "Lord_Voldemort",
+    "shortest_distance": 5
+  },
+  {
+    "start": "Miocene",
+    "target": "Giraffe",
+    "shortest_distance": 2
+  },
+  {
+    "start": "Fort_de_Chartres",
+    "target": "The_Quatermass_Experiment",
+    "shortest_distance": 5
+  },
+  {
+    "start": "Stornoway",
+    "target": "Corporate_finance",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Exploration_of_Mars",
+    "target": "Punctuated_equilibrium",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Spherical_aberration",
+    "target": "Volleyball",
+    "shortest_distance": 4
+  },
+  {
+    "start": "Nahuatl_language",
+    "target": "Red_giant",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Carbon",
+    "target": "Schizophrenia",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Ska",
+    "target": "Andy_Warhol",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Norwich",
+    "target": "Spacecraft_propulsion",
+    "shortest_distance": 4
+  },
+  {
+    "start": "I_Want_to_Hold_Your_Hand",
+    "target": "Nigeria",
+    "shortest_distance": 2
+  },
+  {
+    "start": "Rebecca_Helferich_Clarke",
+    "target": "Pelycosaur",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Star_Trek__The_Original_Series",
+    "target": "Microsoft_Windows",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Porto-Novo",
+    "target": "Osmium",
+    "shortest_distance": 4
+  },
+  {
+    "start": "Edward_III_of_England",
+    "target": "Pel%C3%A9",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Tawny_Owl",
+    "target": "Caesar_cipher",
+    "shortest_distance": 4
+  },
+  {
+    "start": "Permian",
+    "target": "Sociology",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Martin_Van_Buren",
+    "target": "Bamako",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Halfbeak",
+    "target": "Uganda",
+    "shortest_distance": 2
+  },
+  {
+    "start": "England_expects_that_every_man_will_do_his_duty",
+    "target": "Bass_%28fish%29",
+    "shortest_distance": 4
+  },
+  {
+    "start": "Oenothera",
+    "target": "Corinthian_War",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Arp2_3_complex",
+    "target": "Woodworking",
+    "shortest_distance": 5
+  },
+  {
+    "start": "Canadian_Senate",
+    "target": "South_Georgia_and_the_South_Sandwich_Islands",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Camarasaurus",
+    "target": "Platypus",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Egypt",
+    "target": "Lisbon",
+    "shortest_distance": 2
+  },
+  {
+    "start": "Crime_and_Punishment",
+    "target": "Iranian_peoples",
+    "shortest_distance": 2
+  },
+  {
+    "start": "Tower_Bridge",
+    "target": "Claudius",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Aarhus",
+    "target": "Meteorological_history_of_Hurricane_Katrina",
+    "shortest_distance": 4
+  },
+  {
+    "start": "Acts_of_Union_1707",
+    "target": "Manorialism",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Battle_of_Leyte_Gulf",
+    "target": "Dove",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Vasco_da_Gama",
+    "target": "Canterbury_Cathedral",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Emotion",
+    "target": "Cleveland%2C_Ohio",
+    "shortest_distance": 4
+  },
+  {
+    "start": "The_Holocaust",
+    "target": "Whale",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Faroe_Islands",
+    "target": "4-2-0",
+    "shortest_distance": 5
+  },
+  {
+    "start": "Arab-Israeli_conflict",
+    "target": "Abbot",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Tropical_Storm_Ana_%282003%29",
+    "target": "Data_Encryption_Standard",
+    "shortest_distance": 5
+  },
+  {
+    "start": "Fourteenth_Amendment_to_the_United_States_Constitution",
+    "target": "Lerwick",
+    "shortest_distance": 4
+  },
+  {
+    "start": "Crime_and_Punishment",
+    "target": "Forest",
+    "shortest_distance": 2
+  },
+  {
+    "start": "Wernher_von_Braun",
+    "target": "Telephone",
+    "shortest_distance": 3
+  },
+  {
+    "start": "Slovakia",
+    "target": "Acorn_Computers",
+    "shortest_distance": 4
+  }
+]
