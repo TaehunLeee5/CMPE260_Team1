@@ -6,65 +6,65 @@
   "excluded_total_pair_count": 5229,
   "previous_split_files": [
     {
-      "path": "data\\processed\\train.json",
+      "path": "data/processed/train.json",
       "task_count": 80,
       "sha256": "93578b9cafe80e6e39f7627cd78271e74bd52c5adea303e1c37f4a9f421dafdc"
     },
     {
-      "path": "data\\processed\\val.json",
+      "path": "data/processed/val.json",
       "task_count": 10,
       "sha256": "75531fa87a1c0b79c4dc5de15efc3315c7d61970d7c8fc6da01c96701aa916a1"
     },
     {
-      "path": "data\\processed\\test.json",
+      "path": "data/processed/test.json",
       "task_count": 10,
       "sha256": "dc34c95a918f482b5ae593aad153998166fc82fad665094e604484c8a16c4761"
     },
     {
-      "path": "data\\processed\\final_5000\\train.json",
+      "path": "data/processed/final_5000/train.json",
       "task_count": 4000,
       "sha256": "9c703a125190fe224d0443696e4b2aef165d70ec5f137e56f3ec12d35408fa0f"
     },
     {
-      "path": "data\\processed\\final_5000\\val.json",
+      "path": "data/processed/final_5000/val.json",
       "task_count": 500,
       "sha256": "c5cb42d10b3798337813c6a0ab7d2e3eae1ff32344f37a26a9b2bc0ea1ba79a4"
     },
     {
-      "path": "data\\processed\\final_5000\\test.json",
+      "path": "data/processed/final_5000/test.json",
       "task_count": 500,
       "sha256": "227245c9bafde569555942d6adac883af64a9613d0b4a04c632a481072ce9560"
     }
   ],
   "debug_report_files": [
     {
-      "path": "C:\\Users\\Jordan\\Desktop\\CMPE 260\\CMPE260_Team1\\evaluation\\results\\baseline.json",
+      "path": "evaluation/results/baseline.json",
       "recovered_pair_count": 114,
       "sha256": "c76ea01e97dbe9ac1e9bc093ae9eaddfbbcbc38ab2d2d04879902232a13d9aa4"
     },
     {
-      "path": "C:\\Users\\Jordan\\Desktop\\CMPE 260\\CMPE260_Team1\\evaluation\\results\\baseline_colon_4096.json",
+      "path": "evaluation/results/baseline_colon_4096.json",
       "recovered_pair_count": 128,
       "sha256": "fbd7fbcbe69833d1bb93a44e11cc4e2a0788f41645da19ad17133400a9f6d802"
     },
     {
-      "path": "C:\\Users\\Jordan\\Desktop\\CMPE 260\\CMPE260_Team1\\evaluation\\results\\policy_audit.json",
+      "path": "evaluation/results/policy_audit.json",
       "recovered_pair_count": 6,
       "sha256": "d77b224a50a42bbbd82257852a4a53c0261b38ee4295b86a04ea571e93496db9"
     },
     {
-      "path": "C:\\Users\\Jordan\\Desktop\\CMPE 260\\CMPE260_Team1\\evaluation\\results\\policy_audit_colon.json",
+      "path": "evaluation/results/policy_audit_colon.json",
       "recovered_pair_count": 6,
       "sha256": "e02bb0564c5a96a07e0a48c80d21b87f616c7b3d36d5ad1381413c6f77e29823"
     },
     {
-      "path": "C:\\Users\\Jordan\\Desktop\\CMPE 260\\CMPE260_Team1\\evaluation\\results\\policy_decoding_probe.json",
+      "path": "evaluation/results/policy_decoding_probe.json",
       "recovered_pair_count": 6,
       "sha256": "e780b3eba35a94434fbe8b4f00cdb017ddb60606f98f1e0c9526407e98847daa"
     }
   ],
-  "graph_folder": "C:\\Users\\Jordan\\Desktop\\CMPE 260\\CMPE260_Team1\\data\\raw\\graph",
-  "article_order": "C:\\Users\\Jordan\\Desktop\\CMPE 260\\CMPE260_Team1\\data\\processed\\article_order.json",
+  "graph_folder": "data/raw/graph",
+  "article_order": "data/processed/article_order.json",
   "article_order_sha256": "2671450f2dbf1daa1e84f03309222be99fb56db71f1e264fb132264999ef7f68",
   "distance_matrix_sha256": "fab1bff251cbf4606ffd62fdaff4e49783ac6accc3e6074f6fa47a97fdc14f2f",
   "reachable_pairs": 18588235,
